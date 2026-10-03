@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+run_output/
+*.zip
+agent_trace.jsonl

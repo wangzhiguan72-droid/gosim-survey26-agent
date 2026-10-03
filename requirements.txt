@@ -1,0 +1,7 @@
+# This example uses only the Python standard library (json, urllib, math, datetime, ...).
+# No third-party packages are required to run it.
+#
+# If you extend it with a package (e.g. an OpenAI SDK instead of raw urllib calls),
+# list it here AND add a matching "build" step to observer.project.json, e.g.:
+#   "build": [["pip", "install", "-r", "requirements.txt"]]
+# Dependencies are not installed automatically otherwise.
