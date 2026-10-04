@@ -90,6 +90,7 @@ RESCUE_MAX_T_NEED = float(os.environ.get("SAC_RESCUE_MAX_T", "1800"))
 NEAR_MISS_LO = 0.30
 NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "5"))
 NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
+NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
@@ -522,10 +523,12 @@ class Planner:
                 continue
             nights_left = max(1, state.last_night[i] - night_index + 1)
             near = NEAR_MISS_LO <= state.factor[i] < scoring.required_threshold
-            # A near miss (factor already 0.3-0.5) is one modestly longer
-            # exposure away from crossing: keep retrying on a short gap far
-            # beyond the two attempts a cold target gets.
-            attempt_cap = NEAR_MISS_MAX_ATTEMPTS if near else 2
+            # A near miss (factor already 0.3-0.5) is one right-sized exposure
+            # away from crossing. Mid-survey, extra attempts still displace good
+            # science (measured -460 on L4), so beyond the standard two tries
+            # they only unlock in the endgame where opportunity cost is nil.
+            endgame = nights_left <= NEAR_MISS_ENDGAME_NIGHTS
+            attempt_cap = NEAR_MISS_MAX_ATTEMPTS if (near and endgame) else 2
             if state.attempts[i] >= attempt_cap and nights_left > 2:
                 continue
             retry_gap = NEAR_MISS_RETRY_HOURS if near else RESCUE_RETRY_HOURS
