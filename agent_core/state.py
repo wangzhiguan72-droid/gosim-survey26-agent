@@ -30,6 +30,7 @@ class PendingPrediction(NamedTuple):
     alt: float
     az: float
     clean: bool            # true when no all-sky notice / directional block applied at plan time
+    scale: float = 1.0     # sky scale in effect when planned (for band calibration)
 
 
 class FaultEvidence(NamedTuple):
@@ -117,6 +118,7 @@ class SurveyState:
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
+        self.band_bias = 1.0  # closed-loop program declaration bias (see on_result)
         self.force_program: Optional[str] = None
         self.pending: dict[str, PendingPrediction] = {}
         self.pending_program = "BACKUP"
@@ -240,6 +242,8 @@ class SurveyState:
         declared_multiplier = multipliers.get(self.pending_program, 1.0)
         f0t0 = scoring.f0t0
 
+        clean_matched = 0
+        clean_mismatched = 0
         for target_id, prediction in self.pending.items():
             i = self.index_of.get(target_id)
             if i is None:
@@ -257,8 +261,10 @@ class SurveyState:
             if prediction.clean:
                 if abs(multiplier_seen - declared_multiplier) < 2e-4:
                     self._band_checks.append((self.pending_program, True, prediction.model))
+                    clean_matched += 1
                 elif abs(multiplier_seen - mismatch) < 2e-4:
                     self._band_checks.append((self.pending_program, False, prediction.model))
+                    clean_mismatched += 1
             factor_if_match = score / (weight * declared_multiplier) if declared_multiplier > 0 else 0.0
             factor_if_miss = score / (weight * mismatch) if mismatch > 0 else 0.0
             ratio_match = (factor_if_match * f0t0) / (self.flux[i] * self.pending_duration * prediction.model) \
@@ -276,6 +282,16 @@ class SurveyState:
                 if prediction.clean:
                     self.clean_history.append((hours, self.pending_night, ratio))
         self.pending.clear()
+        # Closed-loop declaration bias, once per exposure: a mostly-mismatched
+        # BACKUP/BRIGHT declaration means the actual bands were better than declared
+        # (the band formula excludes instrument efficiency, but the learned scale
+        # absorbs it, skewing predictions low); a mostly-mismatched DARK means the
+        # opposite. Only mismatch outcomes carry this signal, not the ratio samples.
+        if clean_mismatched > clean_matched and clean_matched + clean_mismatched >= 2:
+            if self.pending_program in ("BACKUP", "BRIGHT"):
+                self.band_bias = min(1.35, self.band_bias * 1.04)
+            elif self.pending_program == "DARK":
+                self.band_bias = max(0.8, self.band_bias * 0.96)
         self.update_scale(hours)
 
     def has_recent_sample(self, hours: float) -> bool:
@@ -324,6 +340,7 @@ class SurveyState:
         self._samples.clear()
         self._all_ratios.clear()
         self.prior_scale = 1.0
+        self.band_bias = 1.0
 
     # -- night lookup -------------------------------------------------------------
 

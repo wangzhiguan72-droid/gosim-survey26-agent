@@ -54,13 +54,13 @@ LLM_VETO = os.environ.get("SAC_LLM_VETO", "0") != "0"
 RESCUE_DAMP = os.environ.get("SAC_RESCUE_DAMP", "0") != "0"
 RESCUE_DUR = os.environ.get("SAC_RESCUE_DUR", "1") != "0"
 DONE_FACTOR = 0.95
-PLAN_FACTOR_SAFETY = 0.9
+PLAN_FACTOR_SAFETY = float(os.environ.get("SAC_SAFETY", "0.9"))
 EDGE_MARGIN_DEG = 0.08
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
 NEIGHBOUR_RADIUS_DEG = 2.1
-ANCHORS = 6
-ANCHOR_POOL = 300
+ANCHORS = int(os.environ.get("SAC_ANCHORS", "6"))
+ANCHOR_POOL = int(os.environ.get("SAC_ANCHOR_POOL", "300"))
 CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
@@ -560,7 +560,7 @@ class Planner:
         if not assignments:
             return None
 
-        band_scale = state.scale / 0.95
+        band_scale = (state.scale / 0.95) * state.band_bias
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
         for fiber, item in info.items():
             if str(fiber) not in assignments:
@@ -585,6 +585,7 @@ class Planner:
                 state.pending[state.ids[item["i"]]] = PendingPrediction(
                     model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
+                    scale=state.scale,
                 )
         state.pending_program = program
         state.pending_duration = duration
