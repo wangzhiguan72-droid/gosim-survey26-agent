@@ -81,8 +81,17 @@ class LLMClient:
             self.base_url + "/chat/completions", data=body, method="POST",
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.api_key},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            self.log(f"llm: HTTP {exc.code} from {self.base_url}: {detail}")
+            raise
         text = data["choices"][0]["message"]["content"] or ""
         match = _JSON_OBJECT.search(text)
         if not match:

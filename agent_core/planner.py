@@ -84,6 +84,20 @@ RESCUE_MAX_ATTEMPTS = int(os.environ.get("SAC_RESCUE_MAX_ATTEMPTS", "3"))
 BIG_SPECIAL = 1.0e5
 DEDICATED_PER_NIGHT = int(os.environ.get("SAC_DED_PER_NIGHT", "2"))
 RESCUE_MAX_T_NEED = float(os.environ.get("SAC_RESCUE_MAX_T", "1800"))
+# Near-miss retries: a required target already at factor 0.3-0.5 only needs a
+# slightly longer exposure to cross; dropping it after two attempts wasted
+# ~20 platform-card misses worth of penalty in exactly this band.
+NEAR_MISS_LO = 0.30
+NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "8"))
+NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "6"))
+NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
+NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
+REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.06"))
+# Fault reporting: after the free false allowance is burnt, only a deep drop
+# (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
+# notice explains quality drops for a day after it clears.
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.55"))
+WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "36"))
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -111,6 +125,7 @@ class Planner:
         self.correct_reports = 0
         self.false_since_correct = 0
         self.last_false_hours = float("-inf")
+        self.last_all_weather_hours = float("-inf")
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
         self.night_index_seen: int | None = None
@@ -143,6 +158,9 @@ class Planner:
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
+               for key in state.notices):
+            self.last_all_weather_hours = hours
         state.on_result(payload.get("last_result"), hours)
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
@@ -311,14 +329,21 @@ class Planner:
         state.force_program = None
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 12.0:
             return None
-        if self.false_since_correct >= max(1, state.false_report_free_allowance):
-            return None
+        allowance = max(1, state.false_report_free_allowance)
+        burned = self.false_since_correct >= allowance
+        if burned:
+            # Free falses are spent: only a drop deep enough to be near-certain
+            # fault territory is worth the -150 risk of another try.
+            if self.correct_reports > 0 or self.false_since_correct > allowance:
+                return None
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
+        if burned:
+            threshold = min(threshold, REPORT_DROP_BURNED)
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
@@ -328,8 +353,11 @@ class Planner:
                 self.suspicion_hours = []
                 return None
         # An active ALL-sky weather bulletin explains a global quality drop;
-        # instrument faults are never announced. Sector weather only explains
-        # part of the sky, so a deep global drop underneath it is still a fault.
+        # instrument faults are never announced. The same holds for the day
+        # after one clears: the 2-night evidence window still holds its dip.
+        if hours - self.last_all_weather_hours < WEATHER_LOOKBACK_HOURS:
+            self.suspicion_hours = []
+            return None
         if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
                for key in state.notices):
             self.suspicion_hours = []
@@ -446,9 +474,12 @@ class Planner:
 
         special: dict[int, dict] = {}
 
-        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None) -> None:
+        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None) -> None:
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
-            if alt < state.min_alt + 1.5:
+            # Request windows are short: accept lower anchor altitudes for them
+            # than the generic 1.5 deg cushion the survey plan enjoys.
+            alt_gate = state.min_alt + (0.5 if kind == "request" else 1.5)
+            if alt < alt_gate:
                 return
             ha = wrap180(lst - state.ra[i])
             h = state.hmax[i]
@@ -462,7 +493,7 @@ class Planner:
             if model <= 0.0:
                 return
             q_est = model * max(0.05, state.scale)
-            t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * DEDICATED_SAFETY)
+            t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * (DEDICATED_SAFETY if safety is None else safety))
             t_need = max(float(state.min_exposure), t_need)
             if max_t is not None and t_need > max_t:
                 return
@@ -492,18 +523,29 @@ class Planner:
             if not self._req_rescuable[i]:
                 continue
             nights_left = max(1, state.last_night[i] - night_index + 1)
-            # Two failures without crossing means the flux/quality estimate was
-            # optimistic; a third try only makes sense when nights run out.
-            if state.attempts[i] >= 2 and nights_left > 2:
+            near = NEAR_MISS_LO <= state.factor[i] < scoring.required_threshold
+            # A near miss (factor already 0.3-0.5) is one modestly longer
+            # exposure away from crossing: keep retrying on a short gap far
+            # beyond the two attempts a cold target gets.
+            attempt_cap = NEAR_MISS_MAX_ATTEMPTS if near else 2
+            if state.attempts[i] >= attempt_cap and nights_left > 2:
                 continue
+            retry_gap = NEAR_MISS_RETRY_HOURS if near else RESCUE_RETRY_HOURS
             last = self.rescue_last_try.get(i)
-            if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
+            if last is not None and hours - last < retry_gap and nights_left > 2:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
+            if near:
+                prio += 200.0  # already-proven reachable, just short: cheapest +50 in the book
             # Early on, only cheap rescues are worth the quality dilution; when
             # nights run out, any physically possible attempt is +50 upside.
             max_t = RESCUE_MAX_T_NEED if nights_left > 8 else float(state.max_exposure)
-            consider(i, scoring.required_threshold, "required", prio, None, max_t)
+            if near:
+                # Aim above the line with a stronger cushion: platform evidence
+                # showed first tries landing at 0.47-0.50 against a strict >0.5.
+                consider(i, NEAR_MISS_AIM, "required", prio, None, max_t, safety=NEAR_MISS_SAFETY)
+            else:
+                consider(i, scoring.required_threshold * REQUIRED_AIM_MULT, "required", prio, None, max_t)
         if not special:
             return None
 
