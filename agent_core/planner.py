@@ -73,7 +73,7 @@ REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
-QUAKE_GUARD_HOURS = 60.0
+QUAKE_GUARD_HOURS = 96.0
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
@@ -312,7 +312,7 @@ class Planner:
             return None
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
-        evidence = state.fault_evidence()
+        evidence = state.fault_evidence(hours)
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER

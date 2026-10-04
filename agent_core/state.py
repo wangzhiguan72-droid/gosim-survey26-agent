@@ -332,20 +332,21 @@ class SurveyState:
             return False
         return curr[len(curr) // 2] > 1.05 * prev[len(prev) // 2]
 
-    def fault_evidence(self) -> Optional[FaultEvidence]:
-        history = [(h, n, r) for h, n, r, clean in self.quality_log if clean]
-        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
+    def fault_evidence(self, now_hours: float) -> Optional[FaultEvidence]:
+        # Time-windowed comparison: a count-based window silently depends on the
+        # hit rate (60 samples can be one night or three), which is exactly how
+        # the L3 fault slipped through. Recent = last 8 h, baseline = the 72 h
+        # before that.
+        samples = [(h, n, r) for h, n, r, clean in self.quality_log if clean]
+        if len(samples) < 36:
             # clean samples can starve when events overlap a real fault; the
             # false-report allowance makes an all-samples fallback affordable.
-            history = [(h, n, r) for h, n, r, _clean in self.quality_log]
-        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
+            samples = [(h, n, r) for h, n, r, _clean in self.quality_log]
+        recent = [(h, n, r) for h, n, r in samples if now_hours - h <= 8.0]
+        earlier = [(h, n, r) for h, n, r in samples if 8.0 < now_hours - h <= 72.0]
+        if len(recent) < 12 or len(earlier) < 30:
             return None
-        recent = history[-RECENT_SAMPLES:]
-        earlier = history[:-RECENT_SAMPLES]
-        span = recent[-1][0] - recent[0][0]
-        nights = len({night for _, night, _ in recent})
-        if span < 4.0 or nights < 2:
-            return None
+        nights = len({n for _, n, _ in recent})
         recent_sorted = sorted(r for _, _, r in recent)
         earlier_sorted = sorted(r for _, _, r in earlier)
         recent_median = recent_sorted[len(recent_sorted) // 2]
