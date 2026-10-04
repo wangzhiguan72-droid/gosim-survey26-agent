@@ -331,10 +331,13 @@ class Planner:
                for key in state.notices):
             self.suspicion_nights = set()
             return None
-        # A fault persists; weather passes. Demand the drop on distinct nights.
+        # A fault persists; weather passes. Deep drops (faults are x0.35-0.65,
+        # single-night weather rarely goes that deep against a best-night
+        # baseline) report on the spot; shallower drops must persist nights.
         tonight_idx = evidence.recent_nights
+        deep = evidence.drop < 0.55
         self.suspicion_nights.add(tonight_idx)
-        need_nights = 2 if budget_left else 3
+        need_nights = 1 if (deep and budget_left) else (2 if budget_left else (2 if deep else 3))
         if len(self.suspicion_nights) < need_nights:
             now_dt = parse_utc(payload["now_utc"])
             cur = state.current_night(now_dt)
