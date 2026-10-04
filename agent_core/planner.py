@@ -72,8 +72,7 @@ REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.70"))
 REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.65"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
-FALSE_SUPPRESS_HOURS = 20.0
-QUAKE_GUARD_HOURS = 96.0
+FALSE_SUPPRESS_HOURS = 12.0
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
@@ -120,6 +119,7 @@ class Planner:
         self.request_bonus_full: dict[int, float] = {}
         self.active_reqs: list[dict] = []
         self.rescue_last_try: dict[int, float] = {}
+        self._pending_report_drop: float | None = None
         # A required target is rescuable only if a max-length exposure in near-ideal
         # conditions can plausibly cross the 0.5 threshold; fainter ones must stay
         # buried by the attempts damp or they eat the schedule for nothing.
@@ -149,9 +149,11 @@ class Planner:
             if last_result.get("correct"):
                 self.correct_reports += 1
                 self.false_since_correct = 0
-                # A correct report repairs the instrument: the pre-repair quality
-                # baseline is poisoned now, so start the learning history over.
-                state.forget_quality_history()
+                # The instrument is repaired: efficiency jumps back up by the
+                # inverse of the measured drop. Rescale the learned sky model into
+                # repaired units instead of wiping it -- the atmospheric part of
+                # the model did not change, and relearning it costs a night.
+                state.rescale_quality(1.0 / max(0.05, self._pending_report_drop or 1.0))
                 self.log(f"planner: report CORRECT (+{last_result.get('score_delta')}) at {payload.get('now_utc')}")
             else:
                 # A false report changes nothing about the sky: keep the history
@@ -322,11 +324,6 @@ class Planner:
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_nights = set()
             return None
-        if state.last_quake_at is not None:
-            quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
-            if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
-                self.suspicion_nights = set()
-                return None
         # An active ALL-sky weather bulletin explains a global quality drop;
         # instrument faults are never announced. Sector weather only explains
         # part of the sky, so a deep global drop underneath it is still a fault.
@@ -361,6 +358,7 @@ class Planner:
                 return None
         self.reports += 1
         self.last_report_hours = hours
+        self._pending_report_drop = evidence.drop
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
         return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
                 "decision_source": "llm-confirmed" if verdict else "rule"}

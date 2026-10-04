@@ -400,6 +400,21 @@ class SurveyState:
         self.prior_scale = 1.0
         self.band_bias = 1.0
 
+    def rescale_quality(self, factor: float) -> None:
+        """A correct report repairs the instrument: efficiency jumps back to ~1.
+        Rather than wiping the learned sky model (which also encodes the atmospheric
+        bias that did NOT change), rescale all remembered ratios into repaired units
+        by dividing out the measured drop. band_bias is unaffected and kept."""
+        if factor <= 0.05:
+            self.forget_quality_history()
+            return
+        self.quality_log = deque([(h, n, r / factor, c) for h, n, r, c in self.quality_log], maxlen=20000)
+        self.clean_history = [(h, n, r / factor) for h, n, r in self.clean_history]
+        self._samples = deque([(h, r / factor) for h, r in self._samples], maxlen=self._samples.maxlen)
+        self._all_ratios = deque([r / factor for r in self._all_ratios], maxlen=self._all_ratios.maxlen)
+        self.prior_scale = min(1.5, self.prior_scale / factor)
+        self.scale = min(1.5, self.scale / factor)
+
     # -- night lookup -------------------------------------------------------------
 
     def current_night(self, now):
