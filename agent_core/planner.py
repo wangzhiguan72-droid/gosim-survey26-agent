@@ -259,6 +259,8 @@ class Planner:
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 24.0:
             return None
         evidence = state.fault_evidence()
+        if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
+            self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP if self.reports == 0 else REPORT_DROP - 0.07
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
