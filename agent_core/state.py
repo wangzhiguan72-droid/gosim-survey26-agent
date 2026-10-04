@@ -328,17 +328,26 @@ class SurveyState:
     def quality_recovering(self) -> bool:
         """True when tonight's median quality ratio beats last night's by >5% --
         the signature of earthquake damage decaying, as opposed to a stuck fault."""
+        return self.night_median_trend() == "rising"
+
+    def night_median_trend(self) -> str:
+        """Compare the last three night medians of the quality ratio log.
+
+        A fault holds the ratio flat and low; earthquake damage decays in a
+        monotonic nightly climb; weather fluctuates. Returns "rising" only for
+        the sustained climb (>3% per night, both steps), which quake and
+        clearing weather show and a stuck instrument never does."""
         by_night: dict[int, list[float]] = {}
         for _hours, night, ratio, _clean in self.quality_log:
             by_night.setdefault(night, []).append(ratio)
         nights = sorted(by_night)
-        if len(nights) < 2:
-            return False
-        prev = sorted(by_night[nights[-2]])
-        curr = sorted(by_night[nights[-1]])
-        if not prev or not curr:
-            return False
-        return curr[len(curr) // 2] > 1.05 * prev[len(prev) // 2]
+        if len(nights) < 3:
+            return "unknown"
+        med = lambda k: sorted(by_night[k])[len(by_night[k]) // 2]  # noqa: E731
+        m1, m2, m3 = (med(k) for k in nights[-3:])
+        if m2 > 1.03 * m1 and m3 > 1.03 * m2:
+            return "rising"
+        return "flat"
 
     def fault_evidence(self) -> Optional[FaultEvidence]:
         # All samples, clean or not: on eventful cards nearly every night carries

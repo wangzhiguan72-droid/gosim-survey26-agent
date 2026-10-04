@@ -128,6 +128,7 @@ class Planner:
         self.last_all_weather_hours = float("-inf")
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
+        self.suspicion_nights: list[int] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -358,12 +359,27 @@ class Planner:
                for key in state.notices):
             self.suspicion_hours = []
             return None
+        # A sustained nightly climb in the quality ratio is quake damage
+        # decaying or weather clearing -- a stuck fault never climbs. Vetoing
+        # here is what keeps the free-false allowance for the real thing.
+        if state.night_median_trend() == "rising":
+            self.suspicion_hours = []
+            return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
             return None
+        night = state.current_night(parse_utc(payload["now_utc"]))
         self.suspicion_hours.append(hours)
-        if len(self.suspicion_hours) < REPORT_CONFIRMATIONS:
+        self.suspicion_nights.append(night[0] if night else -1)
+        if len(self.suspicion_hours) > 6:  # a stale same-night chain proves nothing
+            self.suspicion_hours = self.suspicion_hours[-6:]
+            self.suspicion_nights = self.suspicion_nights[-6:]
+        # Confirmations must land on two different nights: a same-night pair
+        # fires on weather dips that look deep for a few hours.
+        if not (len(self.suspicion_hours) >= REPORT_CONFIRMATIONS
+                and self.suspicion_nights[-1] != self.suspicion_nights[-2]):
             return None
         self.suspicion_hours = []
+        self.suspicion_nights = []
         verdict_answer = self.llm.ask_json(
             "You check telescope data quality. A false instrument-fault report costs points, "
             'a correct one earns points. Reply with one JSON object only: {"report": true|false}.',
