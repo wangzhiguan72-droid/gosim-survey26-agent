@@ -64,6 +64,7 @@ ANCHORS = int(os.environ.get("SAC_ANCHORS", "6"))
 ANCHOR_POOL = int(os.environ.get("SAC_ANCHOR_POOL", "300"))
 CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
+WEATHER_EXPLAINS = {"rain", "storm", "overcast", "haze", "cold_snap"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
@@ -323,8 +324,11 @@ class Planner:
             if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
                 self.suspicion_hours = []
                 return None
-        if evidence.dark_checks >= 4 and evidence.dark_matched < 0.5 * evidence.dark_checks:
-            # Bands no longer match: the sky itself degraded, efficiency is fine.
+        # An active ALL-sky weather bulletin explains a global quality drop;
+        # instrument faults are never announced. Sector weather only explains
+        # part of the sky, so a deep global drop underneath it is still a fault.
+        if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
+               for key in state.notices):
             self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
