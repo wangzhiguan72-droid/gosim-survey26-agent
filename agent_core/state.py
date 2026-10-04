@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import bisect
 import math
-import os
 from collections import deque
 from typing import NamedTuple, Optional
 
@@ -132,7 +131,6 @@ class SurveyState:
         self.extra_avoid: set[str] = set()
         self.duration_scale = 1.0
         self.fast_level = 0
-        self._dbg = {"results": 0, "hits": 0}
 
     # -- spatial index -------------------------------------------------------
 
@@ -244,20 +242,10 @@ class SurveyState:
 
     def on_result(self, last_result: Optional[dict], hours: float) -> None:
         if not last_result or last_result.get("action") != "observe" or not self.pending:
-            if os.environ.get("SAC_DEBUG_RESULT"):
-                import sys
-                print(f"state: on_result skip action={last_result.get('action') if last_result else None} "
-                      f"pending={len(self.pending)} qlog={len(self.quality_log)}", file=sys.stderr)
             self.pending.clear()
             return
         hits = {h.get("target_id"): float(h.get("score", 0.0)) for h in last_result.get("hits", [])}
         any_positive = any(score > 0 for score in hits.values())
-        if os.environ.get("SAC_DEBUG_RESULT"):
-            import sys
-            self._dbg["results"] += 1
-            self._dbg["hits"] += len(hits)
-            print(f"state: on_result pending={len(self.pending)} hits={len(hits)} "
-                  f"night={self.pending_night} qlog={len(self.quality_log)}", file=sys.stderr)
         scoring = self.scoring
         multipliers = scoring.program_multipliers
         mismatch = scoring.mismatch_multiplier
@@ -344,49 +332,34 @@ class SurveyState:
             return False
         return curr[len(curr) // 2] > 1.05 * prev[len(prev) // 2]
 
-    def fault_evidence(self, now_hours: float) -> Optional[FaultEvidence]:
-        """Tonight's median quality ratio against the best night ever seen.
-
-        A fault multiplies every exposure by a constant efficiency factor, so the
-        signature is tonight's median sitting at ~0.4-0.7 of the best observed
-        night. Weather dips look the same for ONE night; persistence across
-        nights is checked by the caller (suspicion must span distinct nights).
-        """
+    def fault_evidence(self) -> Optional[FaultEvidence]:
         # All samples, clean or not: on eventful cards nearly every night carries
-        # an ALL-sky notice, so restricting to "clean" samples freezes the window
-        # at the last clean night and blinds the detector (this is exactly how the
-        # L3 fault went unseen). Explained dips are filtered by the caller's
-        # bulletin gates and the two-night persistence rule instead.
-        samples = list(self.quality_log)
-        if not samples:
+        # an ALL-sky notice, so a clean-only window freezes at the last clean
+        # night and blinds the detector (this is exactly how the L3 fault went
+        # unseen). Explained dips are filtered by the caller's bulletin gates.
+        history = [(h, n, r) for h, n, r, _clean in self.quality_log]
+        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
             return None
-        tonight_idx = max(n for _, n, _, *_ in samples)
-        tonight = sorted(r for h, n, r, *_ in samples if n == tonight_idx)
-        if len(tonight) < 15:
+        recent = history[-RECENT_SAMPLES:]
+        earlier = history[:-RECENT_SAMPLES]
+        span = recent[-1][0] - recent[0][0]
+        nights = len({night for _, night, _ in recent})
+        if span < 4.0 or nights < 2:
             return None
-        best = 0.0
-        baseline_nights = 0
-        by_night: dict[int, list[float]] = {}
-        for _h, n, r, *_ in samples:
-            if n != tonight_idx:
-                by_night.setdefault(n, []).append(r)
-        for n, rs in by_night.items():
-            if len(rs) >= 6:
-                baseline_nights += 1
-                best = max(best, sorted(rs)[len(rs) // 2])
-        if baseline_nights < 2 or best <= 0.0:
-            return None
-        tonight_median = tonight[len(tonight) // 2]
+        recent_sorted = sorted(r for _, _, r in recent)
+        earlier_sorted = sorted(r for _, _, r in earlier)
+        recent_median = recent_sorted[len(recent_sorted) // 2]
+        earlier_median = earlier_sorted[len(earlier_sorted) // 2]
         dark_line = self.scoring.program_bands["DARK"] * 1.3
         dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] == "DARK" and (c[2] * best) / 0.95 >= dark_line]
+                if c[0] == "DARK" and (c[2] * earlier_median) / 0.95 >= dark_line]
         return FaultEvidence(
-            recent_median=round(tonight_median, 3),
-            earlier_median=round(best, 3),
-            drop=round(tonight_median / best, 3),
-            recent_samples=len(tonight),
-            recent_nights=tonight_idx,
-            earlier_samples=baseline_nights,
+            recent_median=round(recent_median, 3),
+            earlier_median=round(earlier_median, 3),
+            drop=round(recent_median / max(1e-9, earlier_median), 3),
+            recent_samples=len(recent),
+            recent_nights=nights,
+            earlier_samples=len(earlier),
             dark_checks=len(dark),
             dark_matched=sum(1 for c in dark if c[1]),
         )
@@ -399,21 +372,6 @@ class SurveyState:
         self._all_ratios.clear()
         self.prior_scale = 1.0
         self.band_bias = 1.0
-
-    def rescale_quality(self, factor: float) -> None:
-        """A correct report repairs the instrument: efficiency jumps back to ~1.
-        Rather than wiping the learned sky model (which also encodes the atmospheric
-        bias that did NOT change), rescale all remembered ratios into repaired units
-        by dividing out the measured drop. band_bias is unaffected and kept."""
-        if factor <= 0.05:
-            self.forget_quality_history()
-            return
-        self.quality_log = deque([(h, n, r / factor, c) for h, n, r, c in self.quality_log], maxlen=20000)
-        self.clean_history = [(h, n, r / factor) for h, n, r in self.clean_history]
-        self._samples = deque([(h, r / factor) for h, r in self._samples], maxlen=self._samples.maxlen)
-        self._all_ratios = deque([r / factor for r in self._all_ratios], maxlen=self._all_ratios.maxlen)
-        self.prior_scale = min(1.5, self.prior_scale / factor)
-        self.scale = min(1.5, self.scale / factor)
 
     # -- night lookup -------------------------------------------------------------
 
