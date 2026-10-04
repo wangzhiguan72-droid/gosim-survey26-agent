@@ -73,7 +73,7 @@ REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
-QUAKE_GUARD_HOURS = 60.0
+QUAKE_GUARD_HOURS = 72.0
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
@@ -82,6 +82,8 @@ DEDICATED_MAX_ANCHORS = int(os.environ.get("SAC_DED_ANCHORS", "4"))
 RESCUE_RETRY_HOURS = float(os.environ.get("SAC_RESCUE_RETRY", "12"))
 RESCUE_MAX_ATTEMPTS = int(os.environ.get("SAC_RESCUE_MAX_ATTEMPTS", "3"))
 BIG_SPECIAL = 1.0e5
+DEDICATED_PER_NIGHT = int(os.environ.get("SAC_DED_PER_NIGHT", "2"))
+RESCUE_MAX_T_NEED = float(os.environ.get("SAC_RESCUE_MAX_T", "1800"))
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -120,6 +122,7 @@ class Planner:
         self.request_bonus_full: dict[int, float] = {}
         self.active_reqs: list[dict] = []
         self.rescue_last_try: dict[int, float] = {}
+        self._dedicated_tonight: dict[int, int] = {}
         # A required target is rescuable only if a max-length exposure in near-ideal
         # conditions can plausibly cross the 0.5 threshold; fainter ones must stay
         # buried by the attempts damp or they eat the schedule for nothing.
@@ -321,7 +324,7 @@ class Planner:
             return None
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
-            if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
+            if quake_hours < QUAKE_GUARD_HOURS and state.quality_recovering():
                 self.suspicion_hours = []
                 return None
         # An active ALL-sky weather bulletin explains a global quality drop;
@@ -443,7 +446,7 @@ class Planner:
 
         special: dict[int, dict] = {}
 
-        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None) -> None:
+        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None) -> None:
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
             if alt < state.min_alt + 1.5:
                 return
@@ -461,6 +464,8 @@ class Planner:
             q_est = model * max(0.05, state.scale)
             t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * DEDICATED_SAFETY)
             t_need = max(float(state.min_exposure), t_need)
+            if max_t is not None and t_need > max_t:
+                return
             cap = min(float(state.max_exposure), up, seconds_left)
             if deadline is not None:
                 cap = min(cap, (deadline - now).total_seconds())
@@ -495,8 +500,16 @@ class Planner:
             if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
-            consider(i, scoring.required_threshold, "required", prio)
+            consider(i, scoring.required_threshold, "required", prio, None, RESCUE_MAX_T_NEED)
         if not special:
+            return None
+
+        # Dedicated exposures are quality-diluting by design (they stretch into
+        # worse slots for the lump sum). Cap how many run per night so the survey
+        # schedule stays science-dominated; a night with an open request is exempt
+        # (there are only ~2 requests per card, each a guaranteed +100).
+        has_request = any(sp["kind"] == "request" for sp in special.values())
+        if not has_request and self._dedicated_tonight.get(night_index, 0) >= DEDICATED_PER_NIGHT:
             return None
 
         # A field whose longest need eats most of an hour is only worth it when
@@ -569,6 +582,7 @@ class Planner:
         for _, j, _ in chosen.values():
             if j in special and special[j]["kind"] == "required":
                 self.rescue_last_try[j] = hours
+        self._dedicated_tonight[night_index] = self._dedicated_tonight.get(night_index, 0) + 1
         return self._finish_dedicated(now, lst, c_alt, c_az, chosen, duration, moon, night_index, special)
 
     def _finish_dedicated(self, now, lst, c_alt, c_az, chosen, duration, moon, night_index, special):
