@@ -74,7 +74,7 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload)},
             ],
-            "temperature": 1,
+            "temperature": 0,
             "max_tokens": 250,
         }).encode("utf-8")
         request = urllib.request.Request(

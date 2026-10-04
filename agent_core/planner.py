@@ -42,6 +42,7 @@ from .llm_client import LLMClient
 from .memory import TraceLog
 from .state import PendingPrediction
 
+import math
 import os
 
 REQUIRED_BONUS = float(os.environ.get("SAC_REQ_BONUS", "60"))
@@ -66,10 +67,20 @@ BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP = 0.62
-REPORT_CONFIRMATIONS = 3
-REPORT_SPACING_HOURS = 6.0
-MAX_REPORTS = 2
+REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.78"))
+REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
+REPORT_CONFIRMATIONS = 2
+REPORT_SPACING_HOURS = 2.5
+FALSE_SUPPRESS_HOURS = 20.0
+QUAKE_GUARD_HOURS = 60.0
+MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
+
+# Dedicated completion mode (one-exposure threshold crossings)
+DEDICATED_SAFETY = float(os.environ.get("SAC_DED_SAFETY", "0.85"))
+DEDICATED_MAX_ANCHORS = int(os.environ.get("SAC_DED_ANCHORS", "4"))
+RESCUE_RETRY_HOURS = float(os.environ.get("SAC_RESCUE_RETRY", "12"))
+RESCUE_MAX_ATTEMPTS = int(os.environ.get("SAC_RESCUE_MAX_ATTEMPTS", "3"))
+BIG_SPECIAL = 1.0e5
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -94,6 +105,9 @@ class Planner:
 
         self.observe_count = 0
         self.reports = 0
+        self.correct_reports = 0
+        self.false_since_correct = 0
+        self.last_false_hours = float("-inf")
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
         self.night_index_seen: int | None = None
@@ -103,6 +117,8 @@ class Planner:
         self.total_hit = 0
         self.request_bonus: dict[int, float] = {}
         self.request_bonus_full: dict[int, float] = {}
+        self.active_reqs: list[dict] = []
+        self.rescue_last_try: dict[int, float] = {}
         # A required target is rescuable only if a max-length exposure in near-ideal
         # conditions can plausibly cross the 0.5 threshold; fainter ones must stay
         # buried by the attempts damp or they eat the schedule for nothing.
@@ -128,6 +144,16 @@ class Planner:
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
             self.total_hit += int(last_result.get("hit_count", 0))
+        elif last_result and last_result.get("action") == "report":
+            if last_result.get("correct"):
+                self.correct_reports += 1
+                self.false_since_correct = 0
+                self.log(f"planner: report CORRECT (+{last_result.get('score_delta')}) at {payload.get('now_utc')}")
+            else:
+                self.false_since_correct += 1
+                self.last_false_hours = hours
+                self.log(f"planner: report false at {payload.get('now_utc')} "
+                         f"(false_since_correct={self.false_since_correct})")
         self._pace(payload, now)
         self._update_requests(payload.get("active_requests") or [], now)
 
@@ -156,6 +182,12 @@ class Planner:
         report = self._maybe_report(hours, payload)
         if report is not None:
             return report
+
+        dedicated = self._dedicated_plan(now, night_end, night_index, hours)
+        if dedicated is not None:
+            self.observe_count += 1
+            dedicated["reason"] = f"dedicated: {dedicated.get('goal', '?')} ({len(dedicated['assignments'])} fibres, program {dedicated['program']})"
+            return dedicated
 
         action = self.plan(now, night_end, night_index, hours)
         if action is None:
@@ -254,20 +286,40 @@ class Planner:
     # -- instrument fault reporting (deterministic rules + LLM confirmation) -----
 
     def _maybe_report(self, hours: float, payload: dict):
+        """Instrument-fault reporting.
+
+        Report aggressively once the learned quality level drops well below its own
+        baseline: the first `false_report_free_allowance` false reports after each
+        correct one are free, so probing costs nothing until the budget runs out.
+        Two guards keep the budget from being wasted on lookalikes:
+          * earthquakes are announced in bulletins and their damage decays nightly
+            -- recovering nightly medians mean quake, not fault;
+          * a real fault never changes program-band matching (the band formula
+            excludes efficiency), while bad weather does -- a collapsing DARK
+            match rate means weather.
+        """
         state = self.state
         state.force_program = None
-        if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 24.0:
+        if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 12.0:
+            return None
+        if self.false_since_correct >= max(1, state.false_report_free_allowance):
+            return None
+        if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
-        threshold = REPORT_DROP if self.reports == 0 else REPORT_DROP - 0.07
+        threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
-        if evidence.dark_checks < 6:
-            state.force_program = "DARK"
-        elif evidence.dark_matched < 0.5 * evidence.dark_checks:
+        if state.last_quake_at is not None:
+            quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
+            if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
+                self.suspicion_hours = []
+                return None
+        if evidence.dark_checks >= 4 and evidence.dark_matched < 0.5 * evidence.dark_checks:
+            # Bands no longer match: the sky itself degraded, efficiency is fine.
             self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
@@ -311,15 +363,25 @@ class Planner:
                      + "; ".join(f"{r.get('request_id')} need {r.get('remaining_count', '?')} reward {r.get('completion_reward')}" for r in active))
         bonus: dict[int, float] = {}
         bonus_full: dict[int, float] = {}
+        self.active_reqs = []
         for req in active:
             remaining = req.get("remaining_count")
             if remaining is None:
                 remaining = int(req.get("minimum_completed", 1)) - int(req.get("completed_count", 0))
             remaining = int(remaining)
-            if remaining <= 0:
-                continue
             reward = float(req.get("completion_reward", 0.0))
             completed = {str(t) for t in (req.get("completed_target_ids") or [])}
+            targets_left = [state.index_of[str(t)] for t in (req.get("target_ids") or [])
+                            if str(t) not in completed and str(t) in state.index_of]
+            deadline = parse_utc(req["deadline_utc"]) if req.get("deadline_utc") else None
+            if remaining > 0 and targets_left:
+                self.active_reqs.append({
+                    "id": req.get("request_id"), "targets_left": targets_left,
+                    "remaining": remaining, "reward": reward, "deadline": deadline,
+                    "threshold": float(req.get("completion_factor_threshold", 0.5)),
+                })
+            if remaining <= 0:
+                continue
             urgency = 1.0
             deadline = req.get("deadline_utc")
             if deadline:
@@ -337,6 +399,229 @@ class Planner:
                     bonus_full[i] = bonus_full.get(i, 0.0) + full
         self.request_bonus = bonus
         self.request_bonus_full = bonus_full
+
+    # -- dedicated completion mode ----------------------------------------------
+    # Both observation requests and the required threshold pay a lump sum the
+    # moment ONE exposure crosses g=0.5. The normal scheduler optimizes gain per
+    # second, so a faint target that needs a 1500 s+ exposure to cross never wins
+    # a pointing -- that is exactly why requests went 0/2 and faint required
+    # targets kept missing by a hair. This pass picks the pointing and the
+    # exposure length for THOSE targets, fills the rest of the field normally,
+    # and hands back an ordinary observe action.
+
+    def _fill_value(self, j: int) -> float:
+        """Lightweight fill value for non-special neighbours in a dedicated field."""
+        state = self.state
+        if state.factor[j] >= DONE_FACTOR:
+            return self.request_bonus.get(j, 0.0)
+        damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j])
+        base = state.weight[j] * (1.0 - state.factor[j] ** 2)
+        if state.required[j] and state.factor[j] < 0.5:
+            base += REQUIRED_BONUS
+        return base * damp + self.request_bonus.get(j, 0.0)
+
+    def _dedicated_plan(self, now, night_end, night_index: int, hours: float):
+        state = self.state
+        if state.fast_level >= 2:
+            return None
+        horizon = min(night_end, state.survey_end)
+        seconds_left = (horizon - now).total_seconds()
+        if seconds_left < state.min_exposure + 60:
+            return None
+        lst = local_sidereal_deg(now, state.lon)
+        moon = Moon(now + timedelta(seconds=450), lst, state.lat)
+        scoring = state.scoring
+        f0t0 = scoring.f0t0
+
+        special: dict[int, dict] = {}
+
+        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None) -> None:
+            alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
+            if alt < state.min_alt + 1.5:
+                return
+            ha = wrap180(lst - state.ra[i])
+            h = state.hmax[i]
+            if h < 180 and not (-h <= ha <= h):
+                return
+            up = (h - ha) / SIDEREAL_DEG_PER_SECOND if h < 180 else 1e9
+            if up < state.min_exposure:
+                return
+            lunar = lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)
+            model = scoring.quality_model(alt, lunar) or 0.0
+            if model <= 0.0:
+                return
+            q_est = model * max(0.05, state.scale)
+            t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * DEDICATED_SAFETY)
+            t_need = max(float(state.min_exposure), t_need)
+            cap = min(float(state.max_exposure), up, seconds_left)
+            if deadline is not None:
+                cap = min(cap, (deadline - now).total_seconds())
+            if t_need > cap:
+                return
+            prev = special.get(i)
+            if prev is not None:
+                prev["t_need"] = max(prev["t_need"], t_need)
+                if prio > prev["prio"]:
+                    prev["prio"] = prio
+                if deadline is not None and (prev["deadline"] is None or deadline < prev["deadline"]):
+                    prev["deadline"] = deadline
+                return
+            special[i] = {"t_need": t_need, "prio": prio, "kind": kind,
+                          "alt": alt, "az": az, "model": model, "up": up, "deadline": deadline}
+
+        for req in self.active_reqs:
+            share = req["reward"] / max(1, req["remaining"])
+            for i in req["targets_left"]:
+                consider(i, req["threshold"], "request", 1000.0 + share, req["deadline"])
+        for i in state.active:
+            if not state.required[i] or state.factor[i] >= scoring.required_threshold - 1e-9:
+                continue
+            if not self._req_rescuable[i]:
+                continue
+            if state.attempts[i] >= RESCUE_MAX_ATTEMPTS and state.factor[i] < 0.45:
+                continue
+            nights_left = max(1, state.last_night[i] - night_index + 1)
+            last = self.rescue_last_try.get(i)
+            if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
+                continue
+            prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
+            consider(i, scoring.required_threshold, "required", prio)
+        if not special:
+            return None
+
+        ordered = sorted(special.items(), key=lambda kv: (-kv[1]["prio"], kv[1]["t_need"]))
+        fibers = range(self.grid.n)
+        best = None  # (key, c_alt, c_az, chosen)
+        for anchor, spec in ordered[:DEDICATED_MAX_ANCHORS]:
+            a_alt, a_az = spec["alt"], spec["az"]
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG)
+                    if j in special or state.factor[j] < DONE_FACTOR or self.request_bonus.get(j, 0.0) > 0.0]
+            for fiber in fibers:
+                d_north, d_east = self.grid.fiber_center(fiber)
+                c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
+                if not (state.min_alt + 1.5 <= c_alt <= 89.0):
+                    continue
+                c_alt = round(c_alt, 4)
+                c_az = round(c_az, 4) % 360.0
+                chosen: dict[int, tuple[float, int, float]] = {}
+                for j in near:
+                    v = BIG_SPECIAL + special[j]["prio"] if j in special else self._fill_value(j)
+                    if v <= 0.0:
+                        continue
+                    alt, az = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+                    if alt < state.min_alt + 0.3:
+                        continue
+                    offsets = tangent_offsets(alt, az, c_alt, c_az)
+                    if offsets is None:
+                        continue
+                    fib, margin = self.grid.classify(*offsets)
+                    if fib is None:
+                        continue
+                    score = v if j in special else v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
+                    existing = chosen.get(fib)
+                    if existing is None or score > existing[0]:
+                        chosen[fib] = (score, j, margin)
+                n_special = sum(1 for _, j, _ in chosen.values() if j in special)
+                if n_special == 0:
+                    continue
+                key = (n_special, sum(s for s, _, _ in chosen.values()))
+                if best is None or key > best[0]:
+                    best = (key, c_alt, c_az, chosen)
+        if best is None:
+            return None
+        _, c_alt, c_az, chosen = best
+
+        t_need = 0.0
+        for _, j, _ in chosen.values():
+            sp = special.get(j)
+            if sp is not None:
+                t_need = max(t_need, sp["t_need"])
+        duration = int(math.ceil(t_need / 30.0) * 30)
+        duration = int(max(state.min_exposure, min(state.max_exposure, duration)))
+        duration = min(duration, int(seconds_left))
+        if duration < state.min_exposure:
+            return None
+        for fiber in [f for f, (_, j, _) in chosen.items()
+                      if j in special and (special[j]["up"] < duration
+                                           or (special[j]["deadline"] is not None
+                                               and (now + timedelta(seconds=duration)) > special[j]["deadline"]))]:
+            del chosen[fiber]
+        if not any(j in special for _, j, _ in chosen.values()):
+            return None
+
+        for _, j, _ in chosen.values():
+            if j in special and special[j]["kind"] == "required":
+                self.rescue_last_try[j] = hours
+        return self._finish_dedicated(now, lst, c_alt, c_az, chosen, duration, moon, night_index, special)
+
+    def _finish_dedicated(self, now, lst, c_alt, c_az, chosen, duration, moon, night_index, special):
+        state = self.state
+        scoring = state.scoring
+        info: dict[int, dict] = {}
+        for fiber, (_, j, _margin) in chosen.items():
+            sp = special.get(j)
+            if sp is not None:
+                alt, az, model, up = sp["alt"], sp["az"], sp["model"], sp["up"]
+            else:
+                alt, az = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+                lunar = lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)
+                model = scoring.quality_model(alt, lunar) or 0.0
+                ha = wrap180(lst - state.ra[j])
+                up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
+
+        assignments: dict[str, str] = {}
+        for fiber, item in info.items():
+            if item["up"] >= duration:
+                assignments[str(fiber)] = state.ids[item["i"]]
+        if not assignments:
+            return None
+        if not any(item["i"] in special for fiber, item in info.items() if str(fiber) in assignments):
+            return None
+
+        band_scale = (state.scale / 0.95) * state.band_bias
+        votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
+        for fiber, item in info.items():
+            if str(fiber) not in assignments:
+                continue
+            band = scoring.program_band(item["model"] * band_scale)
+            votes[band] += state.weight[item["i"]] * min(1.0, item["k"] * duration) + \
+                (REQUIRED_BONUS * 0.02 if state.required[item["i"]] else 0.0)
+        program, best_score = "BACKUP", float("-inf")
+        for name in ("DARK", "BRIGHT", "BACKUP"):
+            matched = votes[name] * scoring.program_multipliers.get(name, 1.0)
+            mismatched = (votes["DARK"] + votes["BRIGHT"] + votes["BACKUP"] - votes[name]) * scoring.mismatch_multiplier
+            score = matched + mismatched
+            if score > best_score:
+                best_score, program = score, name
+
+        clean = not state.all_sky_notice()
+        state.pending.clear()
+        for fiber, item in info.items():
+            if str(fiber) in assignments:
+                state.pending[state.ids[item["i"]]] = PendingPrediction(
+                    model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
+                    clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
+                    scale=state.scale,
+                )
+        state.pending_program = program
+        state.pending_duration = duration
+        state.pending_night = night_index
+
+        kinds = {special[j]["kind"] for _, j, _ in chosen.items() if j in special}
+        goal = "+".join(sorted(kinds)) if kinds else "fill"
+        self.log(f"planner: dedicated {goal} exposure at alt={c_alt:.1f} az={c_az:.1f} "
+                 f"for {duration}s covering {sum(1 for _, j, _ in chosen.values() if j in special)} special target(s)")
+
+        return {
+            "action": "observe",
+            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
+            "assignments": assignments,
+            "duration_seconds": duration,
+            "program": program,
+            "goal": goal,
+        }
 
     # -- planning value / achievability -----------------------------------------
 

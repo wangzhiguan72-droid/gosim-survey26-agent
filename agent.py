@@ -71,7 +71,8 @@ def main() -> int:
                 log(f"agent: planner produced an invalid action ({exc}); falling back")
                 action = fallback_action("validation-rejected")
             except Exception as exc:  # noqa: BLE001 - a strategy bug must not end the run
-                log(f"agent: planner error ({type(exc).__name__}: {exc}); falling back")
+                import traceback
+                log(f"agent: planner error ({type(exc).__name__}: {exc}); falling back\n{traceback.format_exc(limit=8)}")
                 action = fallback_action("planner-exception")
             if planner is not None:
                 planner.note_action(action)

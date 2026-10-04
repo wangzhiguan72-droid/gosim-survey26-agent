@@ -116,6 +116,8 @@ class SurveyState:
         self._samples: deque = deque(maxlen=24)           # (hours, ratio)
         self._all_ratios: deque = deque(maxlen=400)        # ratio
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
+        self.quality_log: deque = deque(maxlen=900)        # (hours, night, ratio, clean) -- every sample
+        self.last_quake_at = None                          # datetime of the latest earthquake bulletin seen
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
         self.band_bias = 1.0  # closed-loop program declaration bias (see on_result)
@@ -201,6 +203,14 @@ class SurveyState:
                         self.terrain.add(notice.get("direction"))
             elif message.get("record_type") == "state_resync":
                 self._resync(message.get("observed_target_ids", []), message.get("best_scores", []))
+            # Earthquake bulletins mark efficiency drops a report cannot fix; the
+            # planner uses this to avoid wasting the false-report budget on them.
+            if message.get("record_type") == "bulletin":
+                for notice in message.get("notices", []):
+                    if notice.get("event_kind") == "earthquake":
+                        when = parse_utc(message.get("issued_at_utc") or "")
+                        if when is not None and (self.last_quake_at is None or when > self.last_quake_at):
+                            self.last_quake_at = when
         notices = (latest_bulletin or {}).get("notices", [])
         self.notices = {f"{n.get('event_kind')}|{n.get('direction')}" for n in notices
                         if n.get("event_kind") != "terrain_obstruction"}
@@ -279,6 +289,7 @@ class SurveyState:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
                 self._samples.append((hours, ratio))
                 self._all_ratios.append(ratio)
+                self.quality_log.append((hours, self.pending_night, ratio, prediction.clean))
                 if prediction.clean:
                     self.clean_history.append((hours, self.pending_night, ratio))
         self.pending.clear()
@@ -306,8 +317,27 @@ class SurveyState:
 
     # -- fault diagnostics ------------------------------------------------------
 
+    def quality_recovering(self) -> bool:
+        """True when tonight's median quality ratio beats last night's by >5% --
+        the signature of earthquake damage decaying, as opposed to a stuck fault."""
+        by_night: dict[int, list[float]] = {}
+        for _hours, night, ratio, _clean in self.quality_log:
+            by_night.setdefault(night, []).append(ratio)
+        nights = sorted(by_night)
+        if len(nights) < 2:
+            return False
+        prev = sorted(by_night[nights[-2]])
+        curr = sorted(by_night[nights[-1]])
+        if not prev or not curr:
+            return False
+        return curr[len(curr) // 2] > 1.05 * prev[len(prev) // 2]
+
     def fault_evidence(self) -> Optional[FaultEvidence]:
-        history = self.clean_history
+        history = [(h, n, r) for h, n, r, clean in self.quality_log if clean]
+        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
+            # clean samples can starve when events overlap a real fault; the
+            # false-report allowance makes an all-samples fallback affordable.
+            history = [(h, n, r) for h, n, r, _clean in self.quality_log]
         if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
             return None
         recent = history[-RECENT_SAMPLES:]
@@ -336,6 +366,7 @@ class SurveyState:
 
     def forget_quality_history(self) -> None:
         self.clean_history = []
+        self.quality_log.clear()
         self._band_checks.clear()
         self._samples.clear()
         self._all_ratios.clear()
