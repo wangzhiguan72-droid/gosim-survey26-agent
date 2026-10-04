@@ -103,6 +103,7 @@ class SurveyState:
         n = len(self.ids)
         self.hmax = [max_hour_angle_deg(self.dec[i], self.lat, self.min_alt + ALT_MARGIN_DEG) for i in range(n)]
         self.factor = [0.0] * n
+        self.best_dur = [0] * n  # exposure seconds behind the current best factor
         self.misses = [0] * n
         self.attempts = [0] * n
         self.active = [i for i in range(n) if self.hmax[i] > 0.0]
@@ -287,6 +288,8 @@ class SurveyState:
             band = scoring.program_band(ratio_match * prediction.band_model)
             matched = band == self.pending_program
             factor = factor_if_match if matched else factor_if_miss
+            if min(1.0, factor) > self.factor[i]:
+                self.best_dur[i] = self.pending_duration
             self.factor[i] = max(self.factor[i], min(1.0, factor))
             if self.required[i] and self.factor[i] < scoring.required_threshold:
                 self.attempts[i] += 1

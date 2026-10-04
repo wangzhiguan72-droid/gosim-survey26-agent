@@ -88,15 +88,14 @@ RESCUE_MAX_T_NEED = float(os.environ.get("SAC_RESCUE_MAX_T", "1800"))
 # slightly longer exposure to cross; dropping it after two attempts wasted
 # ~20 platform-card misses worth of penalty in exactly this band.
 NEAR_MISS_LO = 0.30
-NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "8"))
-NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "6"))
+NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "5"))
+NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
-REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.06"))
+REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.55"))
 WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "36"))
 
 
@@ -330,20 +329,16 @@ class Planner:
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 12.0:
             return None
         allowance = max(1, state.false_report_free_allowance)
-        burned = self.false_since_correct >= allowance
-        if burned:
-            # Free falses are spent: only a drop deep enough to be near-certain
-            # fault territory is worth the -150 risk of another try.
-            if self.correct_reports > 0 or self.false_since_correct > allowance:
-                return None
+        if self.false_since_correct >= allowance:
+            # Free falses are spent; the deep-drop escape proved able to mistake
+            # weather for a fault (-150 on the formal-scale card), so stop here.
+            return None
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
-        if burned:
-            threshold = min(threshold, REPORT_DROP_BURNED)
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
@@ -474,7 +469,7 @@ class Planner:
 
         special: dict[int, dict] = {}
 
-        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None) -> None:
+        def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None, t_override: float | None = None) -> None:
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
             # Request windows are short: accept lower anchor altitudes for them
             # than the generic 1.5 deg cushion the survey plan enjoys.
@@ -492,8 +487,11 @@ class Planner:
             model = scoring.quality_model(alt, lunar) or 0.0
             if model <= 0.0:
                 return
-            q_est = model * max(0.05, state.scale)
-            t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * (DEDICATED_SAFETY if safety is None else safety))
+            if t_override is not None:
+                t_need = max(float(state.min_exposure), t_override)
+            else:
+                q_est = model * max(0.05, state.scale)
+                t_need = threshold * f0t0 / max(1e-9, state.flux[i] * q_est * (DEDICATED_SAFETY if safety is None else safety))
             t_need = max(float(state.min_exposure), t_need)
             if max_t is not None and t_need > max_t:
                 return
@@ -536,13 +534,18 @@ class Planner:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
             if near:
-                prio += 200.0  # already-proven reachable, just short: cheapest +50 in the book
+                prio += 60.0  # proven reachable, just short: cheap +50 when it lands
             # Early on, only cheap rescues are worth the quality dilution; when
             # nights run out, any physically possible attempt is +50 upside.
             max_t = RESCUE_MAX_T_NEED if nights_left > 8 else float(state.max_exposure)
-            if near:
-                # Aim above the line with a stronger cushion: platform evidence
-                # showed first tries landing at 0.47-0.50 against a strict >0.5.
+            if near and state.best_dur[i] > 0:
+                # Realized-data retry: scale the exposure that produced the
+                # current best factor. Precise where the model estimate is not.
+                t_retry = state.best_dur[i] * (NEAR_MISS_AIM / max(1e-9, state.factor[i])) * 1.15
+                consider(i, scoring.required_threshold, "required", prio, None, max_t, t_override=t_retry)
+            elif near:
+                # No duration history yet: aim above the line with a cushion --
+                # platform evidence showed first tries landing at 0.47-0.50.
                 consider(i, NEAR_MISS_AIM, "required", prio, None, max_t, safety=NEAR_MISS_SAFETY)
             else:
                 consider(i, scoring.required_threshold * REQUIRED_AIM_MULT, "required", prio, None, max_t)
