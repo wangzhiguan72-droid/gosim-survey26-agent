@@ -148,8 +148,13 @@ class Planner:
             if last_result.get("correct"):
                 self.correct_reports += 1
                 self.false_since_correct = 0
+                # A correct report repairs the instrument: the pre-repair quality
+                # baseline is poisoned now, so start the learning history over.
+                state.forget_quality_history()
                 self.log(f"planner: report CORRECT (+{last_result.get('score_delta')}) at {payload.get('now_utc')}")
             else:
+                # A false report changes nothing about the sky: keep the history
+                # (wiping it would blind the detector for two nights).
                 self.false_since_correct += 1
                 self.last_false_hours = hours
                 self.log(f"planner: report false at {payload.get('now_utc')} "
@@ -345,7 +350,6 @@ class Planner:
                 return None
         self.reports += 1
         self.last_report_hours = hours
-        state.forget_quality_history()
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
         return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
                 "decision_source": "llm-confirmed" if verdict else "rule"}
@@ -478,15 +482,24 @@ class Planner:
                 continue
             if not self._req_rescuable[i]:
                 continue
-            if state.attempts[i] >= RESCUE_MAX_ATTEMPTS and state.factor[i] < 0.45:
-                continue
             nights_left = max(1, state.last_night[i] - night_index + 1)
+            # Two failures without crossing means the flux/quality estimate was
+            # optimistic; a third try only makes sense when nights run out.
+            if state.attempts[i] >= 2 and nights_left > 2:
+                continue
             last = self.rescue_last_try.get(i)
             if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
             consider(i, scoring.required_threshold, "required", prio)
         if not special:
+            return None
+
+        # A field whose longest need eats most of an hour is only worth it when
+        # the targets are running out of nights; early on, better conditions come.
+        if not any(sp["t_need"] <= 2700.0 or sp["kind"] == "request"
+                   or (state.last_night[i] - night_index + 1) <= 5
+                   for i, sp in special.items()):
             return None
 
         ordered = sorted(special.items(), key=lambda kv: (-kv[1]["prio"], kv[1]["t_need"]))
@@ -609,7 +622,7 @@ class Planner:
         state.pending_duration = duration
         state.pending_night = night_index
 
-        kinds = {special[j]["kind"] for _, j, _ in chosen.items() if j in special}
+        kinds = {special[j]["kind"] for _, j, _ in chosen.values() if j in special}
         goal = "+".join(sorted(kinds)) if kinds else "fill"
         self.log(f"planner: dedicated {goal} exposure at alt={c_alt:.1f} az={c_az:.1f} "
                  f"for {duration}s covering {sum(1 for _, j, _ in chosen.values() if j in special)} special target(s)")
