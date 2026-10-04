@@ -500,7 +500,10 @@ class Planner:
             if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
-            consider(i, scoring.required_threshold, "required", prio, None, RESCUE_MAX_T_NEED)
+            # Early on, only cheap rescues are worth the quality dilution; when
+            # nights run out, any physically possible attempt is +50 upside.
+            max_t = RESCUE_MAX_T_NEED if nights_left > 8 else float(state.max_exposure)
+            consider(i, scoring.required_threshold, "required", prio, None, max_t)
         if not special:
             return None
 

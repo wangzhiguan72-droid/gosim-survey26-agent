@@ -226,7 +226,12 @@ class SurveyState:
         top_multiplier = max(self.scoring.program_multipliers.values()) if self.scoring.program_multipliers else 1.2
         for i in range(len(self.ids)):
             score = best.get(self.ids[i], 0.0)
-            self.factor[i] = min(1.0, score / (self.weight[i] * top_multiplier)) if score > 0 and self.weight[i] > 0 else 0.0
+            new_factor = min(1.0, score / (self.weight[i] * top_multiplier)) if score > 0 and self.weight[i] > 0 else 0.0
+            if new_factor < self.factor[i] - 0.05:
+                # Data loss undid the exposures: they never happened, so the
+                # failed-attempt counters that gate the rescue pass must reset too.
+                self.attempts[i] = 0
+            self.factor[i] = new_factor
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
         self.pending.clear()
 
