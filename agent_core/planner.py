@@ -308,17 +308,22 @@ class Planner:
         state.force_program = None
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 12.0:
             return None
-        if self.false_since_correct >= max(1, state.false_report_free_allowance):
-            return None
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence(hours)
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
-        threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
+        budget_left = self.false_since_correct < max(1, state.false_report_free_allowance)
+        threshold = (REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER) if budget_left else 0.60
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
+        # One bad night is weather until proven otherwise; a real fault persists.
+        min_nights = 2 if budget_left else 3
+        if evidence.recent_nights < min_nights and evidence.drop >= 0.50:
+            return None
+        confirmations = REPORT_CONFIRMATIONS if budget_left else 3
+        spacing = REPORT_SPACING_HOURS if budget_left else 6.0
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
             if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
@@ -331,10 +336,10 @@ class Planner:
                for key in state.notices):
             self.suspicion_hours = []
             return None
-        if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
+        if self.suspicion_hours and hours - self.suspicion_hours[-1] < spacing:
             return None
         self.suspicion_hours.append(hours)
-        if len(self.suspicion_hours) < REPORT_CONFIRMATIONS:
+        if len(self.suspicion_hours) < confirmations:
             return None
         self.suspicion_hours = []
         verdict_answer = self.llm.ask_json(
