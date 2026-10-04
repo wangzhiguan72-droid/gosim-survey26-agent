@@ -174,6 +174,10 @@ class Planner:
         if self.night_index_seen != night_index:
             self.night_index_seen = night_index
             self._night_advice(night_start, payload)
+            if os.environ.get("SAC_DEBUG_REPORT"):
+                ev = state.fault_evidence(hours)
+                self.log(f"planner: night {night_index} evidence={ev} quake_at={state.last_quake_at} "
+                         f"notices={sorted(state.notices)} suspicion={sorted(self.suspicion_nights)}")
 
         if (night_end - now).total_seconds() < state.min_exposure:
             nxt = state.next_night_start(now)

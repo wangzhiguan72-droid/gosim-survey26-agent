@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
 from collections import deque
 from typing import NamedTuple, Optional
 
@@ -131,6 +132,7 @@ class SurveyState:
         self.extra_avoid: set[str] = set()
         self.duration_scale = 1.0
         self.fast_level = 0
+        self._dbg = {"results": 0, "hits": 0}
 
     # -- spatial index -------------------------------------------------------
 
@@ -242,10 +244,20 @@ class SurveyState:
 
     def on_result(self, last_result: Optional[dict], hours: float) -> None:
         if not last_result or last_result.get("action") != "observe" or not self.pending:
+            if os.environ.get("SAC_DEBUG_RESULT"):
+                import sys
+                print(f"state: on_result skip action={last_result.get('action') if last_result else None} "
+                      f"pending={len(self.pending)} qlog={len(self.quality_log)}", file=sys.stderr)
             self.pending.clear()
             return
         hits = {h.get("target_id"): float(h.get("score", 0.0)) for h in last_result.get("hits", [])}
         any_positive = any(score > 0 for score in hits.values())
+        if os.environ.get("SAC_DEBUG_RESULT"):
+            import sys
+            self._dbg["results"] += 1
+            self._dbg["hits"] += len(hits)
+            print(f"state: on_result pending={len(self.pending)} hits={len(hits)} "
+                  f"night={self.pending_night} qlog={len(self.quality_log)}", file=sys.stderr)
         scoring = self.scoring
         multipliers = scoring.program_multipliers
         mismatch = scoring.mismatch_multiplier
@@ -340,11 +352,12 @@ class SurveyState:
         night. Weather dips look the same for ONE night; persistence across
         nights is checked by the caller (suspicion must span distinct nights).
         """
-        samples = [(h, n, r) for h, n, r, clean in self.quality_log if clean]
-        if len(samples) < 36:
-            # clean samples can starve when events overlap a real fault; the
-            # false-report allowance makes an all-samples fallback affordable.
-            samples = list(self.quality_log)
+        # All samples, clean or not: on eventful cards nearly every night carries
+        # an ALL-sky notice, so restricting to "clean" samples freezes the window
+        # at the last clean night and blinds the detector (this is exactly how the
+        # L3 fault went unseen). Explained dips are filtered by the caller's
+        # bulletin gates and the two-night persistence rule instead.
+        samples = list(self.quality_log)
         if not samples:
             return None
         tonight_idx = max(n for _, n, _, *_ in samples)
