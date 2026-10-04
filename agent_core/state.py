@@ -116,7 +116,7 @@ class SurveyState:
         self._samples: deque = deque(maxlen=24)           # (hours, ratio)
         self._all_ratios: deque = deque(maxlen=400)        # ratio
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
-        self.quality_log: deque = deque(maxlen=900)        # (hours, night, ratio, clean) -- every sample
+        self.quality_log: deque = deque(maxlen=20000)      # (hours, night, ratio, clean) -- the whole run
         self.last_quake_at = None                          # datetime of the latest earthquake bulletin seen
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
@@ -349,7 +349,7 @@ class SurveyState:
             return None
         tonight_idx = max(n for _, n, _, *_ in samples)
         tonight = sorted(r for h, n, r, *_ in samples if n == tonight_idx)
-        if len(tonight) < 8:
+        if len(tonight) < 15:
             return None
         best = 0.0
         baseline_nights = 0

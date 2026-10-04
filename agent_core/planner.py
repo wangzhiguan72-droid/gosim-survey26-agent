@@ -68,8 +68,8 @@ WEATHER_EXPLAINS = {"rain", "storm", "overcast", "haze", "cold_snap"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.78"))
-REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
+REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.70"))
+REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.65"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
