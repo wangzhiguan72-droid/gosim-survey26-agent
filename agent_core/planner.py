@@ -110,7 +110,7 @@ class Planner:
         self.false_since_correct = 0
         self.last_false_hours = float("-inf")
         self.last_report_hours = float("-inf")
-        self.suspicion_hours: list[float] = []
+        self.suspicion_nights: set[int] = set()
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -314,34 +314,32 @@ class Planner:
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
         budget_left = self.false_since_correct < max(1, state.false_report_free_allowance)
-        threshold = (REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER) if budget_left else 0.60
+        threshold = (REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER) if budget_left else 0.62
         if evidence is None or evidence.drop >= threshold:
-            self.suspicion_hours = []
+            self.suspicion_nights = set()
             return None
-        # One bad night is weather until proven otherwise; a real fault persists.
-        min_nights = 2 if budget_left else 3
-        if evidence.recent_nights < min_nights and evidence.drop >= 0.50:
-            return None
-        confirmations = REPORT_CONFIRMATIONS if budget_left else 3
-        spacing = REPORT_SPACING_HOURS if budget_left else 6.0
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
             if quake_hours < QUAKE_GUARD_HOURS and evidence.drop >= 0.55 and state.quality_recovering():
-                self.suspicion_hours = []
+                self.suspicion_nights = set()
                 return None
         # An active ALL-sky weather bulletin explains a global quality drop;
         # instrument faults are never announced. Sector weather only explains
         # part of the sky, so a deep global drop underneath it is still a fault.
         if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
                for key in state.notices):
-            self.suspicion_hours = []
+            self.suspicion_nights = set()
             return None
-        if self.suspicion_hours and hours - self.suspicion_hours[-1] < spacing:
-            return None
-        self.suspicion_hours.append(hours)
-        if len(self.suspicion_hours) < confirmations:
-            return None
-        self.suspicion_hours = []
+        # A fault persists; weather passes. Demand the drop on distinct nights.
+        tonight_idx = evidence.recent_nights
+        self.suspicion_nights.add(tonight_idx)
+        need_nights = 2 if budget_left else 3
+        if len(self.suspicion_nights) < need_nights:
+            now_dt = parse_utc(payload["now_utc"])
+            cur = state.current_night(now_dt)
+            final_night = cur is not None and cur[0] == len(state.nights) - 1
+            if not (final_night and evidence.drop < 0.6):
+                return None
         verdict_answer = self.llm.ask_json(
             "You check telescope data quality. A false instrument-fault report costs points, "
             'a correct one earns points. Reply with one JSON object only: {"report": true|false}.',
