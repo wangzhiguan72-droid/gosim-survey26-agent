@@ -883,7 +883,10 @@ class Planner:
         anchors.sort(key=lambda t: -t[0])
 
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
-        fibers = range(self.grid.n) if state.fast_level < 2 else (5, 6, 9, 10)
+        # Level 2 probes a spread of fibres instead of the full grid; the old
+        # hard-coded (5,6,9,10) would index past a 9-fibre card and crash.
+        fibers = (range(self.grid.n) if state.fast_level < 2
+                  else tuple(range(0, self.grid.n, max(1, self.grid.n // 4))) or (0,))
         best = None  # (total, c_alt, c_az, chosen)
         tried = 0
         for _, anchor in anchors:
