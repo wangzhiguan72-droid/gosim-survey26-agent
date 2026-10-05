@@ -130,6 +130,9 @@ class Planner:
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
         self.suspicion_nights: list[int] = []
+        self._decide_t0 = 0.0
+        self._decide_seconds = 0.0
+        self._decide_count = 0
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -152,6 +155,15 @@ class Planner:
     # -- top-level decision ----------------------------------------------------
 
     def decide(self, payload: dict) -> dict:
+        import time as _time
+        self._decide_t0 = _time.monotonic()
+        try:
+            return self._decide(payload)
+        finally:
+            self._decide_seconds += _time.monotonic() - self._decide_t0
+            self._decide_count += 1
+
+    def _decide(self, payload: dict) -> dict:
         state = self.state
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
@@ -243,15 +255,29 @@ class Planner:
         return int(max(60, min(3600, slot - into if into else slot)))
 
     def _pace(self, payload: dict, now) -> None:
-        """Do less work per decision when the wall clock is short for the nights still to come."""
+        """Do less work per decision when the wall clock is short for the nights still to come.
+
+        Two signals: the nominal per-decision budget (remaining wall clock over
+        the decisions still owed) and, once a track record exists, the MEASURED
+        seconds per decision. The measured rate is what actually protects the
+        900 s wall clock on formal-scale cards (50k targets ran 0.33 s/decision
+        locally while the nominal budget said everything was fine)."""
         state = self.state
         remaining_wall = float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9))
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
         decisions_left = max(1.0, night_seconds / 700.0)
         per_decision = remaining_wall / decisions_left
         level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
+        if self._decide_count >= 30:
+            measured = self._decide_seconds / self._decide_count
+            projected = measured * decisions_left
+            if projected > 0.97 * remaining_wall:
+                level = 2
+            elif projected > 0.80 * remaining_wall:
+                level = max(level, 1)
         if level != state.fast_level:
-            self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left)")
+            self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left, "
+                     f"measured {self._decide_seconds / max(1, self._decide_count) * 1000:.0f} ms)")
             state.fast_level = level
 
     # -- LLM: two calls once per night, merged -----------------------------------
