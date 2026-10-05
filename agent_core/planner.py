@@ -488,10 +488,7 @@ class Planner:
 
         def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None, t_override: float | None = None) -> None:
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
-            # Request windows are short: accept lower anchor altitudes for them
-            # than the generic 1.5 deg cushion the survey plan enjoys.
-            alt_gate = state.min_alt + (0.5 if kind == "request" else 1.5)
-            if alt < alt_gate:
+            if alt < state.min_alt + 1.5:
                 return
             ha = wrap180(lst - state.ra[i])
             h = state.hmax[i]
@@ -540,34 +537,42 @@ class Planner:
             nights_left = max(1, state.last_night[i] - night_index + 1)
             near = NEAR_MISS_LO <= state.factor[i] < scoring.required_threshold
             # A near miss (factor already 0.3-0.5) is one right-sized exposure
-            # away from crossing. Mid-survey, extra attempts still displace good
-            # science (measured -460 on L4), so beyond the standard two tries
-            # they only unlock in the endgame where opportunity cost is nil.
+            # away from crossing. Mid-survey that retry displaces multi-special
+            # fields and pollutes the schedule (measured -4600 summed over the
+            # bench cards), so the extra machinery only arms in the endgame,
+            # where opportunity cost is nil. Everything before that stays on
+            # the exact v6b code path.
             endgame = nights_left <= NEAR_MISS_ENDGAME_NIGHTS
-            attempt_cap = NEAR_MISS_MAX_ATTEMPTS if (near and endgame) else 2
-            if state.attempts[i] >= attempt_cap and nights_left > 2:
+            if not (near and endgame):
+                # Two failures without crossing means the flux/quality estimate
+                # was optimistic; a third try only makes sense when nights run out.
+                if state.attempts[i] >= 2 and nights_left > 2:
+                    continue
+                last = self.rescue_last_try.get(i)
+                if last is not None and hours - last < RESCUE_RETRY_HOURS and nights_left > 2:
+                    continue
+                prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
+                # Early on, only cheap rescues are worth the quality dilution; when
+                # nights run out, any physically possible attempt is +50 upside.
+                max_t = RESCUE_MAX_T_NEED if nights_left > 8 else float(state.max_exposure)
+                consider(i, scoring.required_threshold, "required", prio, None, max_t)
                 continue
-            retry_gap = NEAR_MISS_RETRY_HOURS if near else RESCUE_RETRY_HOURS
+            if state.attempts[i] >= NEAR_MISS_MAX_ATTEMPTS:
+                continue
             last = self.rescue_last_try.get(i)
-            if last is not None and hours - last < retry_gap and nights_left > 2:
+            if last is not None and hours - last < NEAR_MISS_RETRY_HOURS:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
-            if near:
-                prio += 60.0  # proven reachable, just short: cheap +50 when it lands
-            # Early on, only cheap rescues are worth the quality dilution; when
-            # nights run out, any physically possible attempt is +50 upside.
-            max_t = RESCUE_MAX_T_NEED if nights_left > 8 else float(state.max_exposure)
-            if near and state.best_dur[i] > 0:
+            max_t = float(state.max_exposure)
+            if state.best_dur[i] > 0:
                 # Realized-data retry: scale the exposure that produced the
                 # current best factor. Precise where the model estimate is not.
                 t_retry = state.best_dur[i] * (NEAR_MISS_AIM / max(1e-9, state.factor[i])) * 1.15
                 consider(i, scoring.required_threshold, "required", prio, None, max_t, t_override=t_retry)
-            elif near:
-                # No duration history yet: aim above the line with a cushion --
+            else:
+                # No duration history: aim above the line with a cushion --
                 # platform evidence showed first tries landing at 0.47-0.50.
                 consider(i, NEAR_MISS_AIM, "required", prio, None, max_t, safety=NEAR_MISS_SAFETY)
-            else:
-                consider(i, scoring.required_threshold * REQUIRED_AIM_MULT, "required", prio, None, max_t)
         if not special:
             return None
 
