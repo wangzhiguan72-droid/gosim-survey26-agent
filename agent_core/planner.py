@@ -69,20 +69,13 @@ WEATHER_EXPLAINS = {"rain", "storm", "overcast", "haze", "cold_snap"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.50"))
-REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.45"))
+REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.78"))
+REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
 QUAKE_GUARD_HOURS = float(os.environ.get("SAC_QUAKE_GUARD", "30"))
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
-# v8 gates: a report needs a SUSTAINED deep drop (all recent nights far below the
-# healthy reference -- clearing weather and one-night storms recover) and an
-# azimuth-UNIFORM one (clouds and fronts are directional; an efficiency fault
-# multiplies every direction equally).
-REPORT_SUSTAINED_FRAC = float(os.environ.get("SAC_REPORT_SUSFRAC", "0.62"))
-REPORT_SUSTAINED_MAX = float(os.environ.get("SAC_REPORT_SUSMAX", "0.68"))
-REPORT_QUAD_SPREAD = float(os.environ.get("SAC_REPORT_QUAD", "0.30"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
 DEDICATED_SAFETY = float(os.environ.get("SAC_DED_SAFETY", "0.85"))
@@ -99,6 +92,11 @@ NEAR_MISS_LO = 0.30
 NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "5"))
 NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
+# Mid-survey, ANY perturbation of the dedicated pass gets amplified into
+# thousands of points of chaos (formal B lost 5k to the unmasked v8 retries).
+# The retry machinery therefore only unlocks in the survey's own last
+# SURVEY_TAIL_NIGHTS nights, where displaced fields have no future value.
+SURVEY_TAIL_NIGHTS = int(os.environ.get("SAC_SURVEY_TAIL", "12"))
 REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
@@ -106,7 +104,7 @@ REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.40"))
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.45"))
 WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 
@@ -433,20 +431,8 @@ class Planner:
             # only in certain-fault territory -- flat, no recovery trend, and far
             # deeper than any weather-only dip observed so far.
             threshold = min(threshold, REPORT_DROP_BURNED)
-        if evidence is None:
-            return None
-        ref = max(1e-9, evidence.earlier_median)
-        sustained = (evidence.recent_nightly
-                     and all(m < REPORT_SUSTAINED_FRAC * ref for m in evidence.recent_nightly)
-                     and max(evidence.recent_nightly) < REPORT_SUSTAINED_MAX * ref)
-        if not sustained or evidence.drop >= threshold:
+        if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
-            return None
-        if evidence.quad_spread < REPORT_QUAD_SPREAD:
-            # One compass quadrant far worse than another = a front, not the
-            # instrument: an efficiency fault divides every direction equally.
-            if dbg:
-                self.log(f"planner: report veto directional (quad spread {evidence.quad_spread})")
             return None
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
@@ -656,7 +642,8 @@ class Planner:
             # where opportunity cost is nil. Everything before that stays on
             # the exact v6b code path.
             endgame = nights_left <= NEAR_MISS_ENDGAME_NIGHTS
-            if not (near and endgame):
+            survey_tail = len(state.nights) - night_index <= SURVEY_TAIL_NIGHTS
+            if not (near and endgame and survey_tail):
                 # Two failures without crossing means the flux/quality estimate
                 # was optimistic; a third try only makes sense when nights run out.
                 if state.attempts[i] >= 2 and nights_left > 2:

@@ -22,8 +22,6 @@ ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
 RECENT_SAMPLES = 60
 EARLIER_SAMPLES = 60
-MIN_NIGHTS_FOR_EVIDENCE = 10
-RISE_STEP_PER_NIGHT = float(os.environ.get("SAC_RISE_STEP", "0.40"))
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 
 
@@ -331,27 +329,8 @@ class SurveyState:
 
     # -- fault diagnostics ------------------------------------------------------
 
-    def _nightly_groups(self) -> dict[int, list[float]]:
-        """quality_log grouped by night, cached: the log only grows between
-        results, and the detector asks on most decisions -- on a 365-night card
-        the rescan would eat the wall-clock budget (measured ~8ms x 17k calls)."""
-        cache_len, cache = getattr(self, "_ng_cache", (None, None))
-        if cache_len == len(self.quality_log):
-            return cache
-        by_night: dict[int, list[float]] = {}
-        for _h, night, ratio, _clean, _az in self.quality_log:
-            by_night.setdefault(night, []).append(ratio)
-        self._ng_cache = (len(self.quality_log), by_night)
-        return by_night
-
-    def night_medians(self, min_samples: int = 5) -> dict[int, float]:
-        """Median quality ratio per completed night (nights with too few samples
-        are weather-truncated and would mislead both the reference and the drop)."""
-        return {n: sorted(v)[len(v) // 2] for n, v in self._nightly_groups().items()
-                if len(v) >= min_samples}
-
     def quality_recovering(self) -> bool:
-        """True when the nightly medians are in a strong sustained climb --
+        """True when tonight's median quality ratio beats last night's by >5% --
         the signature of earthquake damage decaying, as opposed to a stuck fault."""
         return self.night_median_trend() == "rising"
 
@@ -359,75 +338,61 @@ class SurveyState:
         """Compare the last three night medians of the quality ratio log.
 
         A fault holds the ratio flat and low; earthquake damage decays in a
-        steep monotonic nightly climb (the L3 quake recovered ~2x per night);
-        weather on top of a stuck fault wobbles by tens of percent. "rising"
-        therefore needs >RISE_STEP_PER_NIGHT on BOTH steps."""
-        by_night = self._nightly_groups()
+        monotonic nightly climb; weather fluctuates. Returns "rising" only for
+        the sustained climb (>3% per night, both steps), which quake and
+        clearing weather show and a stuck instrument never does."""
+        by_night: dict[int, list[float]] = {}
+        for _hours, night, ratio, _clean, _az in self.quality_log:
+            by_night.setdefault(night, []).append(ratio)
         nights = sorted(by_night)
         if len(nights) < 3:
             return "unknown"
-        med = lambda k: sorted(by_night[k])[len(by_night[k]) // 2]  # noqa: E731
+        med = lambda k: sorted(by_night[k])[len(by_night[k]) // 2]  # noqa: E71
         m1, m2, m3 = (med(k) for k in nights[-3:])
-        step = 1.0 + RISE_STEP_PER_NIGHT
-        if m2 > step * m1 and m3 > step * m2:
+        if m2 > 1.03 * m1 and m3 > 1.03 * m2:
             return "rising"
         return "flat"
 
     def fault_evidence(self) -> Optional[FaultEvidence]:
-        """v8 detector signal, built from nightly medians rather than a pooled
-        sample window.
-
-        The pooled window failed twice on real cards: a weeks-long fault drags
-        the all-history `earlier` median down with it (the L3 quake-masked fault
-        never dropped below 0.79 of a poisoned baseline), and intra-night sample
-        selection during storms made the pooled median report 0.17 on nights
-        whose engine quality was normal (two paid false reports on formal D).
-        The reference here is instead the median of the TOP HALF of past nights
-        -- what the instrument demonstrably achieves in decent weather -- which
-        faults and bad seasons do not drag down."""
-        nightly = self.night_medians()
-        if len(nightly) < MIN_NIGHTS_FOR_EVIDENCE:
+        # All samples, clean or not: on eventful cards nearly every night carries
+        # an ALL-sky notice, so a clean-only window freezes at the last clean
+        # night and blinds the detector (this is exactly how the L3 fault went
+        # unseen). Explained dips are filtered by the caller's bulletin gates.
+        # (v8's nightly-median/healthy-reference variant won +556 on the local
+        # L3 card but lost -700 on formal A: platform seasonal weather runs
+        # DEEPER than platform faults, so depth-based firing is inverted there.
+        # Reverted to this pooled form after the 2026-10-05 v8 platform batch.)
+        history = [(h, n, r) for h, n, r, _clean, _az in self.quality_log]
+        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
             return None
-        ordered = sorted(nightly.values())
-        half = len(ordered) // 2
-        top = ordered[-half:] if half else ordered  # the worse half is discarded
-        ref = top[len(top) // 2]
-        if ref <= 1e-9:
+        recent = history[-RECENT_SAMPLES:]
+        earlier = history[:-RECENT_SAMPLES]
+        span = recent[-1][0] - recent[0][0]
+        nights = len({night for _, night, _ in recent})
+        if span < 4.0 or nights < 2:
             return None
-        recent_nightly = tuple(nightly[k] for k in sorted(nightly)[-3:])
-        samples = [(n, r, az) for _h, n, r, _c, az in self.quality_log]
-        recent_samples = samples[-RECENT_SAMPLES:]
-        span_nights = len({n for n, _r, _az in recent_samples})
-        quads: dict[int, list[float]] = {}
-        for _n, r, az in recent_samples:
-            quads.setdefault(az, []).append(r)
-        qm = [sorted(v)[len(v) // 2] for v in quads.values() if len(v) >= 4]
-        quad_spread = (min(qm) / max(qm)) if len(qm) >= 2 else 1.0
-        recent_median = recent_nightly[len(recent_nightly) // 2]
+        recent_sorted = sorted(r for _, _, r in recent)
+        earlier_sorted = sorted(r for _, _, r in earlier)
+        recent_median = recent_sorted[len(recent_sorted) // 2]
+        earlier_median = earlier_sorted[len(earlier_sorted) // 2]
         dark_line = self.scoring.program_bands["DARK"] * 1.3
         dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] == "DARK" and (c[2] * ref) / 0.95 >= dark_line]
+                if c[0] == "DARK" and (c[2] * earlier_median) / 0.95 >= dark_line]
         return FaultEvidence(
             recent_median=round(recent_median, 3),
-            earlier_median=round(ref, 3),
-            drop=round(recent_median / ref, 3),
-            recent_samples=len(recent_samples),
-            recent_nights=span_nights,
-            earlier_samples=len(top),
+            earlier_median=round(earlier_median, 3),
+            drop=round(recent_median / max(1e-9, earlier_median), 3),
+            recent_samples=len(recent),
+            recent_nights=nights,
+            earlier_samples=len(earlier),
             dark_checks=len(dark),
             dark_matched=sum(1 for c in dark if c[1]),
-            recent_nightly=tuple(round(m, 3) for m in recent_nightly),
-            quad_spread=round(quad_spread, 3),
         )
 
     def forget_quality_history(self) -> None:
-        """After a correct report repairs the instrument: re-learn the sky scale
-        from scratch (efficiency just jumped), but KEEP the quality log and band
-        checks -- the v8 healthy reference is a top-half median, so the
-        fault-period samples sitting in the discarded half cannot poison it, and
-        keeping the history means the detector re-arms immediately instead of
-        going blind for ten nights on a 30-night card."""
         self.clean_history = []
+        self.quality_log.clear()
+        self._band_checks.clear()
         self._samples.clear()
         self._all_ratios.clear()
         self.prior_scale = 1.0
