@@ -331,13 +331,24 @@ class SurveyState:
 
     # -- fault diagnostics ------------------------------------------------------
 
-    def night_medians(self, min_samples: int = 5) -> dict[int, float]:
-        """Median quality ratio per completed night (nights with too few samples
-        are weather-truncated and would mislead both the reference and the drop)."""
+    def _nightly_groups(self) -> dict[int, list[float]]:
+        """quality_log grouped by night, cached: the log only grows between
+        results, and the detector asks on most decisions -- on a 365-night card
+        the rescan would eat the wall-clock budget (measured ~8ms x 17k calls)."""
+        cache_len, cache = getattr(self, "_ng_cache", (None, None))
+        if cache_len == len(self.quality_log):
+            return cache
         by_night: dict[int, list[float]] = {}
         for _h, night, ratio, _clean, _az in self.quality_log:
             by_night.setdefault(night, []).append(ratio)
-        return {n: sorted(v)[len(v) // 2] for n, v in by_night.items() if len(v) >= min_samples}
+        self._ng_cache = (len(self.quality_log), by_night)
+        return by_night
+
+    def night_medians(self, min_samples: int = 5) -> dict[int, float]:
+        """Median quality ratio per completed night (nights with too few samples
+        are weather-truncated and would mislead both the reference and the drop)."""
+        return {n: sorted(v)[len(v) // 2] for n, v in self._nightly_groups().items()
+                if len(v) >= min_samples}
 
     def quality_recovering(self) -> bool:
         """True when the nightly medians are in a strong sustained climb --
@@ -351,9 +362,7 @@ class SurveyState:
         steep monotonic nightly climb (the L3 quake recovered ~2x per night);
         weather on top of a stuck fault wobbles by tens of percent. "rising"
         therefore needs >RISE_STEP_PER_NIGHT on BOTH steps."""
-        by_night: dict[int, list[float]] = {}
-        for _hours, night, ratio, _clean, _az in self.quality_log:
-            by_night.setdefault(night, []).append(ratio)
+        by_night = self._nightly_groups()
         nights = sorted(by_night)
         if len(nights) < 3:
             return "unknown"
