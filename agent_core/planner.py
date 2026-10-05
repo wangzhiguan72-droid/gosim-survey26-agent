@@ -57,7 +57,8 @@ RESCUE_DUR = os.environ.get("SAC_RESCUE_DUR", "1") != "0"
 DONE_FACTOR = 0.95
 PLAN_FACTOR_SAFETY = float(os.environ.get("SAC_SAFETY", "0.9"))
 EDGE_MARGIN_DEG = 0.08
-DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
+DURATIONS = tuple(int(x) for x in os.environ.get(
+    "SAC_DURS", "300,450,600,900,1200,1500,1800,2400,3000,3600").split(","))
 MIN_VISIBLE_SECONDS = 600
 NEIGHBOUR_RADIUS_DEG = 2.1
 ANCHORS = int(os.environ.get("SAC_ANCHORS", "6"))
@@ -91,6 +92,7 @@ NEAR_MISS_LO = 0.30
 NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "5"))
 NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
+REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
@@ -532,7 +534,9 @@ class Planner:
 
         def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None, t_override: float | None = None) -> None:
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
-            if alt < state.min_alt + 1.5:
+            # Request windows are short: a smaller altitude cushion for their
+            # anchors than the survey-wide 1.5 deg (SAC_REQ_ALT_MARGIN).
+            if alt < state.min_alt + (REQ_ALT_MARGIN if kind == "request" else 1.5):
                 return
             ha = wrap180(lst - state.ra[i])
             h = state.hmax[i]
