@@ -379,12 +379,13 @@ class SurveyState:
         nightly = self.night_medians()
         if len(nightly) < MIN_NIGHTS_FOR_EVIDENCE:
             return None
-        ordered = sorted(nightly)
-        ref_nights = ordered[:len(ordered) // 2]  # worse half discarded
-        ref = ref_nights[len(ref_nights) // 2]
+        ordered = sorted(nightly.values())
+        half = len(ordered) // 2
+        top = ordered[-half:] if half else ordered  # the worse half is discarded
+        ref = top[len(top) // 2]
         if ref <= 1e-9:
             return None
-        recent_nightly = tuple(sorted(nightly)[-3:])
+        recent_nightly = tuple(nightly[k] for k in sorted(nightly)[-3:])
         samples = [(n, r, az) for _h, n, r, _c, az in self.quality_log]
         recent_samples = samples[-RECENT_SAMPLES:]
         span_nights = len({n for n, _r, _az in recent_samples})
@@ -403,7 +404,7 @@ class SurveyState:
             drop=round(recent_median / ref, 3),
             recent_samples=len(recent_samples),
             recent_nights=span_nights,
-            earlier_samples=len(ref_nights),
+            earlier_samples=len(top),
             dark_checks=len(dark),
             dark_matched=sum(1 for c in dark if c[1]),
             recent_nightly=tuple(round(m, 3) for m in recent_nightly),
@@ -411,9 +412,13 @@ class SurveyState:
         )
 
     def forget_quality_history(self) -> None:
+        """After a correct report repairs the instrument: re-learn the sky scale
+        from scratch (efficiency just jumped), but KEEP the quality log and band
+        checks -- the v8 healthy reference is a top-half median, so the
+        fault-period samples sitting in the discarded half cannot poison it, and
+        keeping the history means the detector re-arms immediately instead of
+        going blind for ten nights on a 30-night card."""
         self.clean_history = []
-        self.quality_log.clear()
-        self._band_checks.clear()
         self._samples.clear()
         self._all_ratios.clear()
         self.prior_scale = 1.0
