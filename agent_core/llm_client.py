@@ -32,6 +32,14 @@ from typing import Optional
 
 DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1"
 DEFAULT_MODEL = "k3"
+# Endpoint self-healing: the platform injects OPENAI_BASE_URL/MODEL, which can
+# lag behind the team model actually saved (observed frozen at kimi/k3 while a
+# GLM coding-plan key was live). On auth/model errors we retry once against
+# this alternate endpoint with the SAME injected key. No keys are baked in.
+FALLBACK_ENDPOINTS = [
+    ("https://open.bigmodel.cn/api/coding/paas/v4", "glm-5.3-flash"),
+    ("https://api.kimi.com/coding/v1", "k3"),
+]
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
 
 
@@ -60,6 +68,8 @@ class LLMClient:
         self.spent_seconds = 0.0
         self.calls_made = 0
         self.quota_dead = False
+        self._fallbacks = [(b, m) for b, m in FALLBACK_ENDPOINTS
+                           if b != self.base_url]
 
     def _budget_left(self, wallclock_remaining_seconds: float) -> float:
         # Never let a model call eat into the last minute of wall clock, and never
@@ -123,11 +133,20 @@ class LLMClient:
                 return self._attempt(system_prompt, user_payload, timeout)
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code in (401, 402, 403, 429):
-                    # Quota/auth death: retrying cannot help within this run, and
-                    # hammering a rate limit wastes the wall clock.
+                if exc.code in (401, 402, 403, 404):
+                    # Auth/model mismatch or exhausted quota on THIS endpoint:
+                    # try the alternate endpoint with the same injected key
+                    # before declaring the run LLM-dead.
+                    if self._fallbacks:
+                        self.base_url, self.model = self._fallbacks.pop(0)
+                        self.log(f"llm: HTTP {exc.code}; switching endpoint to {self.base_url} model {self.model}")
+                        continue
                     self.quota_dead = True
-                    self.log(f"llm: HTTP {exc.code} (quota/auth); no further model calls this run")
+                    self.log(f"llm: HTTP {exc.code} (auth/quota) and no endpoint left; LLM off for this run")
+                    return None
+                if exc.code == 429:
+                    self.quota_dead = True
+                    self.log("llm: HTTP 429 (rate/quota); LLM off for this run")
                     return None
             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
                 last_error = exc
