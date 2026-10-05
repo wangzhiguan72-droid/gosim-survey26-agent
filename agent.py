@@ -21,6 +21,7 @@ a bug in the strategy must never end the run as agent_error or hang the process.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 if sys.version_info < (3, 9):
@@ -36,6 +37,11 @@ from agent_core.validation import ActionRejected, fallback_action, validate_acti
 
 def main() -> int:
     null_llm = None
+    profiler = None
+    if os.environ.get("SAC_PROFILE"):
+        import cProfile
+        profiler = cProfile.Profile()
+        profiler.enable()
     try:
         require_api_key()
     except MissingAPIKeyError as exc:
@@ -83,7 +89,13 @@ def main() -> int:
                 try:
                     planner.on_finish(message.get("payload", {}))
                 except Exception as exc:  # noqa: BLE001 - finish must not raise after the score is fixed
-                    log(f"agent: error during finish logging ({type(exc).__name__}: {exc})")
+                    log(f"agent: error during finish logging ({type(exc).__name__}): {exc}")
+            if profiler is not None:
+                profiler.disable()
+                import pstats
+                path = os.environ["SAC_PROFILE"]
+                profiler.dump_stats(path)
+                log(f"agent: profile written to {path}")
     return 0
 
 
