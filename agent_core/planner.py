@@ -73,7 +73,7 @@ REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
-QUAKE_GUARD_HOURS = 72.0
+QUAKE_GUARD_HOURS = float(os.environ.get("SAC_QUAKE_GUARD", "30"))
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
@@ -353,7 +353,6 @@ class Planner:
             if quake_hours < QUAKE_GUARD_HOURS and state.quality_recovering():
                 if dbg:
                     self.log(f"planner: report veto quake-guard (quake {quake_hours:.0f}h ago, recovering)")
-                self.suspicion_hours = []
                 return None
         # An active ALL-sky weather bulletin explains a global quality drop;
         # instrument faults are never announced. The same holds for the day
@@ -373,7 +372,6 @@ class Planner:
         if state.night_median_trend() == "rising":
             if dbg:
                 self.log("planner: report veto rising-trend")
-            self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
             return None
