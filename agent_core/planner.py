@@ -99,7 +99,7 @@ REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.45"))
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.40"))
 WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 
@@ -132,6 +132,7 @@ class Planner:
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
         self.suspicion_nights: list[int] = []
+        self.deep_escape_used = False
         self._decide_t0 = 0.0
         self._decide_seconds = 0.0
         self._decide_count = 0
@@ -369,6 +370,11 @@ class Planner:
             return None
         allowance = max(1, state.false_report_free_allowance)
         deep_only = self.false_since_correct >= allowance
+        if deep_only and self.deep_escape_used:
+            # The one post-allowance deep-drop probe was spent (D-card evidence:
+            # a catastrophic weather season sustains ratio 0.07 for weeks and
+            # would burn -150 per re-report without this stop).
+            return None
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
@@ -443,6 +449,8 @@ class Planner:
                 return None
         self.reports += 1
         self.last_report_hours = hours
+        if deep_only:
+            self.deep_escape_used = True
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
         return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
                 "decision_source": "llm-confirmed" if verdict else "rule"}
