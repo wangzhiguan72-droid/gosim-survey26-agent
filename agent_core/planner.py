@@ -142,6 +142,7 @@ class Planner:
         self._decide_t0 = 0.0
         self._decide_seconds = 0.0
         self._decide_count = 0
+        self._t_report = self._t_dedicated = self._t_plan = self._t_onresult = 0.0
         self._recent_decide_durs: list[float] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
@@ -180,6 +181,7 @@ class Planner:
             del self._recent_decide_durs[:-24]
 
     def _decide(self, payload: dict) -> dict:
+        import time as _t
         state = self.state
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
@@ -198,7 +200,9 @@ class Planner:
             self._notice_events.append((round(hours, 3), sorted(state.notices),
                                         round(quake_hours, 2) if quake_hours is not None else None))
             self._notice_sig = sig
+        t0 = _t.monotonic()
         state.on_result(payload.get("last_result"), hours)
+        self._t_onresult += _t.monotonic() - t0
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -244,17 +248,23 @@ class Planner:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
 
+        t0 = _t.monotonic()
         report = self._maybe_report(hours, payload)
+        self._t_report += _t.monotonic() - t0
         if report is not None:
             return report
 
+        t0 = _t.monotonic()
         dedicated = self._dedicated_plan(now, night_end, night_index, hours)
+        self._t_dedicated += _t.monotonic() - t0
         if dedicated is not None:
             self.observe_count += 1
             dedicated["reason"] = f"dedicated: {dedicated.get('goal', '?')} ({len(dedicated['assignments'])} fibres, program {dedicated['program']})"
             return dedicated
 
+        t0 = _t.monotonic()
         action = self.plan(now, night_end, night_index, hours)
+        self._t_plan += _t.monotonic() - t0
         if action is None:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "nothing useful is up"}
@@ -286,6 +296,11 @@ class Planner:
             self.log(f"planner: quality dump written to {dump_path}")
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
                  f"observes={self.observe_count} reports={self.reports} llm_calls={self.llm.calls_made}")
+        if os.environ.get("SAC_TIMING"):
+            self.log(f"planner: timing seconds decide={self._decide_seconds:.1f} "
+                     f"on_result={self._t_onresult:.1f} report={self._t_report:.1f} "
+                     f"dedicated={self._t_dedicated:.1f} plan={self._t_plan:.1f} "
+                     f"over {self._decide_count} decisions")
 
     def note_action(self, action: dict) -> None:
         """Called by agent.py right after an action is validated, so the consecutive-report
@@ -702,9 +717,14 @@ class Planner:
             return None
 
         ordered = sorted(special.items(), key=lambda kv: (-kv[1]["prio"], kv[1]["t_need"]))
-        fibers = range(self.grid.n)
+        # The dedicated anchor search costs O(anchors x fibres x neighbours) and
+        # runs before every plan pass; on 100-fibre year-long cards it alone can
+        # eat a third of the wall clock, so pace pressure narrows it too.
+        n_anchors = DEDICATED_MAX_ANCHORS if state.fast_level < 1 else max(1, DEDICATED_MAX_ANCHORS // 2)
+        fibers = (range(self.grid.n) if state.fast_level < 2
+                  else tuple(range(0, self.grid.n, max(1, self.grid.n // 4))) or (0,))
         best = None  # (key, c_alt, c_az, chosen)
-        for anchor, spec in ordered[:DEDICATED_MAX_ANCHORS]:
+        for anchor, spec in ordered[:n_anchors]:
             a_alt, a_az = spec["alt"], spec["az"]
             near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG)
                     if j in special or state.factor[j] < DONE_FACTOR or self.request_bonus.get(j, 0.0) > 0.0]
