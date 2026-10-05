@@ -97,7 +97,7 @@ REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "36"))
+WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "12"))
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -344,15 +344,20 @@ class Planner:
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
+        dbg = os.environ.get("SAC_DEBUG_REPORT")
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
             if quake_hours < QUAKE_GUARD_HOURS and state.quality_recovering():
+                if dbg:
+                    self.log(f"planner: report veto quake-guard (quake {quake_hours:.0f}h ago, recovering)")
                 self.suspicion_hours = []
                 return None
         # An active ALL-sky weather bulletin explains a global quality drop;
         # instrument faults are never announced. The same holds for the day
         # after one clears: the 2-night evidence window still holds its dip.
         if hours - self.last_all_weather_hours < WEATHER_LOOKBACK_HOURS:
+            if dbg:
+                self.log(f"planner: report veto weather-lookback ({hours - self.last_all_weather_hours:.0f}h since ALL notice)")
             self.suspicion_hours = []
             return None
         if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
@@ -363,6 +368,8 @@ class Planner:
         # decaying or weather clearing -- a stuck fault never climbs. Vetoing
         # here is what keeps the free-false allowance for the real thing.
         if state.night_median_trend() == "rising":
+            if dbg:
+                self.log("planner: report veto rising-trend")
             self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
@@ -377,6 +384,8 @@ class Planner:
         # fires on weather dips that look deep for a few hours.
         if not (len(self.suspicion_hours) >= REPORT_CONFIRMATIONS
                 and self.suspicion_nights[-1] != self.suspicion_nights[-2]):
+            if dbg:
+                self.log(f"planner: suspicion holds (nights {self.suspicion_nights[-3:]})")
             return None
         self.suspicion_hours = []
         self.suspicion_nights = []
