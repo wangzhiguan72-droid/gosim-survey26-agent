@@ -133,6 +133,7 @@ class Planner:
         self._decide_t0 = 0.0
         self._decide_seconds = 0.0
         self._decide_count = 0
+        self._recent_decide_durs: list[float] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -160,8 +161,11 @@ class Planner:
         try:
             return self._decide(payload)
         finally:
-            self._decide_seconds += _time.monotonic() - self._decide_t0
+            dur = _time.monotonic() - self._decide_t0
+            self._decide_seconds += dur
             self._decide_count += 1
+            self._recent_decide_durs.append(dur)
+            del self._recent_decide_durs[:-24]
 
     def _decide(self, payload: dict) -> dict:
         state = self.state
@@ -268,12 +272,16 @@ class Planner:
         decisions_left = max(1.0, night_seconds / 700.0)
         per_decision = remaining_wall / decisions_left
         level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
-        if self._decide_count >= 30:
-            measured = self._decide_seconds / self._decide_count
+        if len(self._recent_decide_durs) >= 12:
+            # Median of recent decisions: one slow decision (e.g. processing a
+            # state_resync over tens of thousands of targets) must not clamp
+            # the whole run into 4-fibre survival mode.
+            durs = sorted(self._recent_decide_durs)
+            measured = durs[len(durs) // 2]
             projected = measured * decisions_left
             if projected > 0.97 * remaining_wall:
                 level = 2
-            elif projected > 0.80 * remaining_wall:
+            elif projected > 0.88 * remaining_wall:
                 level = max(level, 1)
         if level != state.fast_level:
             self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left, "
@@ -882,7 +890,7 @@ class Planner:
             return None
         anchors.sort(key=lambda t: -t[0])
 
-        n_anchors = 1 if state.fast_level >= 1 else ANCHORS
+        n_anchors = max(2, ANCHORS // 2) if state.fast_level >= 1 else ANCHORS
         # Level 2 probes a spread of fibres instead of the full grid; the old
         # hard-coded (5,6,9,10) would index past a 9-fibre card and crash.
         fibers = (range(self.grid.n) if state.fast_level < 2
