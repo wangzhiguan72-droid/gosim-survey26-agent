@@ -94,12 +94,12 @@ NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
 REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
-NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
+NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.62"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.40"))
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.45"))
 WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 
