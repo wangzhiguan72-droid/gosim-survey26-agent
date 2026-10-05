@@ -97,7 +97,8 @@ REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "12"))
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.45"))
+WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -331,16 +332,18 @@ class Planner:
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 12.0:
             return None
         allowance = max(1, state.false_report_free_allowance)
-        if self.false_since_correct >= allowance:
-            # Free falses are spent; the deep-drop escape proved able to mistake
-            # weather for a fault (-150 on the formal-scale card), so stop here.
-            return None
+        deep_only = self.false_since_correct >= allowance
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
         if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
             self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
+        if deep_only:
+            # Allowance burnt (e.g. by a seasonal weather stretch): one more try
+            # only in certain-fault territory -- flat, no recovery trend, and far
+            # deeper than any weather-only dip observed so far.
+            threshold = min(threshold, REPORT_DROP_BURNED)
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
