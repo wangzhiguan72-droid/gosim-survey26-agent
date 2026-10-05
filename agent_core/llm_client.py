@@ -59,6 +59,7 @@ class LLMClient:
         self.max_retries = max_retries
         self.spent_seconds = 0.0
         self.calls_made = 0
+        self.quota_dead = False
 
     def _budget_left(self, wallclock_remaining_seconds: float) -> float:
         # Never let a model call eat into the last minute of wall clock, and never
@@ -105,6 +106,8 @@ class LLMClient:
         """One planning question, answered as exactly one JSON object. Retries up to
         `max_retries` times on failure; returns None once the budget/call cap/retries
         are exhausted, so the caller's rule-based answer can take over for this step."""
+        if self.quota_dead:
+            return None
         last_error: Optional[Exception] = None
         for _attempt_number in range(self.max_retries):
             if self.calls_made >= self.max_calls:
@@ -118,6 +121,14 @@ class LLMClient:
             self.calls_made += 1
             try:
                 return self._attempt(system_prompt, user_payload, timeout)
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code in (401, 402, 403, 429):
+                    # Quota/auth death: retrying cannot help within this run, and
+                    # hammering a rate limit wastes the wall clock.
+                    self.quota_dead = True
+                    self.log(f"llm: HTTP {exc.code} (quota/auth); no further model calls this run")
+                    return None
             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
                 last_error = exc
             finally:
