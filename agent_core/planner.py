@@ -55,7 +55,7 @@ LLM_VETO = os.environ.get("SAC_LLM_VETO", "0") != "0"
 RESCUE_DAMP = os.environ.get("SAC_RESCUE_DAMP", "0") != "0"
 RESCUE_DUR = os.environ.get("SAC_RESCUE_DUR", "1") != "0"
 DONE_FACTOR = 0.95
-PLAN_FACTOR_SAFETY = float(os.environ.get("SAC_SAFETY", "0.9"))
+PLAN_FACTOR_SAFETY = float(os.environ.get("SAC_SAFETY", "0.85"))
 EDGE_MARGIN_DEG = 0.08
 DURATIONS = tuple(int(x) for x in os.environ.get(
     "SAC_DURS", "300,450,600,900,1200,1500,1800,2400,3000,3600").split(","))
