@@ -275,8 +275,8 @@ class Planner:
             nightly = {str(k): sorted(v)[len(v) // 2] for k, v in sorted(by_night.items())}
             with open(dump_path, "w", encoding="utf-8") as fh:
                 _json.dump({
-                    "samples": [(round(h, 3), n, round(r, 4), c)
-                                for h, n, r, c in state.quality_log],
+                    "samples": [(round(h, 3), n, round(r, 4), c, az)
+                                for h, n, r, c, az in state.quality_log],
                     "nightly_medians": nightly,
                     "notice_events": self._notice_events,
                     "report_log": self._report_log,
