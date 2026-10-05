@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
 from collections import deque
 from typing import NamedTuple, Optional
 
@@ -21,6 +22,8 @@ ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
 RECENT_SAMPLES = 60
 EARLIER_SAMPLES = 60
+MIN_NIGHTS_FOR_EVIDENCE = 10
+RISE_STEP_PER_NIGHT = float(os.environ.get("SAC_RISE_STEP", "0.40"))
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 
 
@@ -35,13 +38,15 @@ class PendingPrediction(NamedTuple):
 
 class FaultEvidence(NamedTuple):
     recent_median: float
-    earlier_median: float
-    drop: float
+    earlier_median: float   # v8: healthy reference (median of the top half of past nights)
+    drop: float             # v8: median of the last three nightly medians / healthy reference
     recent_samples: int
     recent_nights: int
     earlier_samples: int
     dark_checks: int
     dark_matched: int
+    recent_nightly: tuple = ()   # the last three nightly medians, oldest first
+    quad_spread: float = 1.0     # min/max azimuth-quadrant median in the recent window
 
 
 def _mod(a: float, n: float) -> float:
@@ -117,7 +122,7 @@ class SurveyState:
         self._samples: deque = deque(maxlen=24)           # (hours, ratio)
         self._all_ratios: deque = deque(maxlen=400)        # ratio
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
-        self.quality_log: deque = deque(maxlen=20000)      # (hours, night, ratio, clean) -- the whole run
+        self.quality_log: deque = deque(maxlen=20000)      # (hours, night, ratio, clean, az_quad)
         self.last_quake_at = None                          # datetime of the latest earthquake bulletin seen
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
@@ -297,7 +302,8 @@ class SurveyState:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
                 self._samples.append((hours, ratio))
                 self._all_ratios.append(ratio)
-                self.quality_log.append((hours, self.pending_night, ratio, prediction.clean))
+                self.quality_log.append((hours, self.pending_night, ratio, prediction.clean,
+                                         int((prediction.az % 360.0) // 90)))
                 if prediction.clean:
                     self.clean_history.append((hours, self.pending_night, ratio))
         self.pending.clear()
@@ -325,8 +331,16 @@ class SurveyState:
 
     # -- fault diagnostics ------------------------------------------------------
 
+    def night_medians(self, min_samples: int = 5) -> dict[int, float]:
+        """Median quality ratio per completed night (nights with too few samples
+        are weather-truncated and would mislead both the reference and the drop)."""
+        by_night: dict[int, list[float]] = {}
+        for _h, night, ratio, _clean, _az in self.quality_log:
+            by_night.setdefault(night, []).append(ratio)
+        return {n: sorted(v)[len(v) // 2] for n, v in by_night.items() if len(v) >= min_samples}
+
     def quality_recovering(self) -> bool:
-        """True when tonight's median quality ratio beats last night's by >5% --
+        """True when the nightly medians are in a strong sustained climb --
         the signature of earthquake damage decaying, as opposed to a stuck fault."""
         return self.night_median_trend() == "rising"
 
@@ -334,51 +348,66 @@ class SurveyState:
         """Compare the last three night medians of the quality ratio log.
 
         A fault holds the ratio flat and low; earthquake damage decays in a
-        monotonic nightly climb; weather fluctuates. Returns "rising" only for
-        the sustained climb (>3% per night, both steps), which quake and
-        clearing weather show and a stuck instrument never does."""
+        steep monotonic nightly climb (the L3 quake recovered ~2x per night);
+        weather on top of a stuck fault wobbles by tens of percent. "rising"
+        therefore needs >RISE_STEP_PER_NIGHT on BOTH steps."""
         by_night: dict[int, list[float]] = {}
-        for _hours, night, ratio, _clean in self.quality_log:
+        for _hours, night, ratio, _clean, _az in self.quality_log:
             by_night.setdefault(night, []).append(ratio)
         nights = sorted(by_night)
         if len(nights) < 3:
             return "unknown"
         med = lambda k: sorted(by_night[k])[len(by_night[k]) // 2]  # noqa: E731
         m1, m2, m3 = (med(k) for k in nights[-3:])
-        if m2 > 1.03 * m1 and m3 > 1.03 * m2:
+        step = 1.0 + RISE_STEP_PER_NIGHT
+        if m2 > step * m1 and m3 > step * m2:
             return "rising"
         return "flat"
 
     def fault_evidence(self) -> Optional[FaultEvidence]:
-        # All samples, clean or not: on eventful cards nearly every night carries
-        # an ALL-sky notice, so a clean-only window freezes at the last clean
-        # night and blinds the detector (this is exactly how the L3 fault went
-        # unseen). Explained dips are filtered by the caller's bulletin gates.
-        history = [(h, n, r) for h, n, r, _clean in self.quality_log]
-        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
+        """v8 detector signal, built from nightly medians rather than a pooled
+        sample window.
+
+        The pooled window failed twice on real cards: a weeks-long fault drags
+        the all-history `earlier` median down with it (the L3 quake-masked fault
+        never dropped below 0.79 of a poisoned baseline), and intra-night sample
+        selection during storms made the pooled median report 0.17 on nights
+        whose engine quality was normal (two paid false reports on formal D).
+        The reference here is instead the median of the TOP HALF of past nights
+        -- what the instrument demonstrably achieves in decent weather -- which
+        faults and bad seasons do not drag down."""
+        nightly = self.night_medians()
+        if len(nightly) < MIN_NIGHTS_FOR_EVIDENCE:
             return None
-        recent = history[-RECENT_SAMPLES:]
-        earlier = history[:-RECENT_SAMPLES]
-        span = recent[-1][0] - recent[0][0]
-        nights = len({night for _, night, _ in recent})
-        if span < 4.0 or nights < 2:
+        ordered = sorted(nightly)
+        ref_nights = ordered[:len(ordered) // 2]  # worse half discarded
+        ref = ref_nights[len(ref_nights) // 2]
+        if ref <= 1e-9:
             return None
-        recent_sorted = sorted(r for _, _, r in recent)
-        earlier_sorted = sorted(r for _, _, r in earlier)
-        recent_median = recent_sorted[len(recent_sorted) // 2]
-        earlier_median = earlier_sorted[len(earlier_sorted) // 2]
+        recent_nightly = tuple(sorted(nightly)[-3:])
+        samples = [(n, r, az) for _h, n, r, _c, az in self.quality_log]
+        recent_samples = samples[-RECENT_SAMPLES:]
+        span_nights = len({n for n, _r, _az in recent_samples})
+        quads: dict[int, list[float]] = {}
+        for _n, r, az in recent_samples:
+            quads.setdefault(az, []).append(r)
+        qm = [sorted(v)[len(v) // 2] for v in quads.values() if len(v) >= 4]
+        quad_spread = (min(qm) / max(qm)) if len(qm) >= 2 else 1.0
+        recent_median = recent_nightly[len(recent_nightly) // 2]
         dark_line = self.scoring.program_bands["DARK"] * 1.3
         dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] == "DARK" and (c[2] * earlier_median) / 0.95 >= dark_line]
+                if c[0] == "DARK" and (c[2] * ref) / 0.95 >= dark_line]
         return FaultEvidence(
             recent_median=round(recent_median, 3),
-            earlier_median=round(earlier_median, 3),
-            drop=round(recent_median / max(1e-9, earlier_median), 3),
-            recent_samples=len(recent),
-            recent_nights=nights,
-            earlier_samples=len(earlier),
+            earlier_median=round(ref, 3),
+            drop=round(recent_median / ref, 3),
+            recent_samples=len(recent_samples),
+            recent_nights=span_nights,
+            earlier_samples=len(ref_nights),
             dark_checks=len(dark),
             dark_matched=sum(1 for c in dark if c[1]),
+            recent_nightly=tuple(round(m, 3) for m in recent_nightly),
+            quad_spread=round(quad_spread, 3),
         )
 
     def forget_quality_history(self) -> None:

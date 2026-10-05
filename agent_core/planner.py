@@ -69,13 +69,20 @@ WEATHER_EXPLAINS = {"rain", "storm", "overcast", "haze", "cold_snap"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.78"))
-REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.72"))
+REPORT_DROP_FIRST = float(os.environ.get("SAC_REPORT_DROP", "0.50"))
+REPORT_DROP_LATER = float(os.environ.get("SAC_REPORT_DROP2", "0.45"))
 REPORT_CONFIRMATIONS = 2
 REPORT_SPACING_HOURS = 2.5
 FALSE_SUPPRESS_HOURS = 20.0
 QUAKE_GUARD_HOURS = float(os.environ.get("SAC_QUAKE_GUARD", "30"))
 MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
+# v8 gates: a report needs a SUSTAINED deep drop (all recent nights far below the
+# healthy reference -- clearing weather and one-night storms recover) and an
+# azimuth-UNIFORM one (clouds and fronts are directional; an efficiency fault
+# multiplies every direction equally).
+REPORT_SUSTAINED_FRAC = float(os.environ.get("SAC_REPORT_SUSFRAC", "0.62"))
+REPORT_SUSTAINED_MAX = float(os.environ.get("SAC_REPORT_SUSMAX", "0.68"))
+REPORT_QUAD_SPREAD = float(os.environ.get("SAC_REPORT_QUAD", "0.30"))
 
 # Dedicated completion mode (one-exposure threshold crossings)
 DEDICATED_SAFETY = float(os.environ.get("SAC_DED_SAFETY", "0.85"))
@@ -99,7 +106,7 @@ REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
 # notice explains quality drops for a day after it clears.
-REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.45"))
+REPORT_DROP_BURNED = float(os.environ.get("SAC_REPORT_DROP3", "0.40"))
 WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 
@@ -263,7 +270,7 @@ class Planner:
             import json as _json
             state = self.state
             by_night: dict[int, list[float]] = {}
-            for _h, night, ratio, _clean in state.quality_log:
+            for _h, night, ratio, _clean, _az in state.quality_log:
                 by_night.setdefault(night, []).append(ratio)
             nightly = {str(k): sorted(v)[len(v) // 2] for k, v in sorted(by_night.items())}
             with open(dump_path, "w", encoding="utf-8") as fh:
@@ -402,7 +409,8 @@ class Planner:
         if hours - self.last_false_hours < FALSE_SUPPRESS_HOURS:
             return None
         evidence = state.fault_evidence()
-        if evidence is not None and os.environ.get("SAC_DEBUG_REPORT"):
+        dbg = os.environ.get("SAC_DEBUG_REPORT")
+        if evidence is not None and dbg:
             self.log(f"planner: fault evidence {evidence}")
         threshold = REPORT_DROP_FIRST if self.correct_reports == 0 else REPORT_DROP_LATER
         if deep_only:
@@ -410,10 +418,21 @@ class Planner:
             # only in certain-fault territory -- flat, no recovery trend, and far
             # deeper than any weather-only dip observed so far.
             threshold = min(threshold, REPORT_DROP_BURNED)
-        if evidence is None or evidence.drop >= threshold:
+        if evidence is None:
+            return None
+        ref = max(1e-9, evidence.earlier_median)
+        sustained = (evidence.recent_nightly
+                     and all(m < REPORT_SUSTAINED_FRAC * ref for m in evidence.recent_nightly)
+                     and max(evidence.recent_nightly) < REPORT_SUSTAINED_MAX * ref)
+        if not sustained or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
-        dbg = os.environ.get("SAC_DEBUG_REPORT")
+        if evidence.quad_spread < REPORT_QUAD_SPREAD:
+            # One compass quadrant far worse than another = a front, not the
+            # instrument: an efficiency fault divides every direction equally.
+            if dbg:
+                self.log(f"planner: report veto directional (quad spread {evidence.quad_spread})")
+            return None
         if state.last_quake_at is not None:
             quake_hours = (parse_utc(payload["now_utc"]) - state.last_quake_at).total_seconds() / 3600.0
             if quake_hours < QUAKE_GUARD_HOURS and state.quality_recovering():
@@ -642,11 +661,23 @@ class Planner:
             if last is not None and hours - last < NEAR_MISS_RETRY_HOURS:
                 continue
             prio = 500.0 + scoring.required_penalty + state.weight[i] + 30.0 / nights_left
+            if last is not None:
+                # Starvation guard: the anchor pick is a static priority sort, so
+                # a near miss stuck just below the top few anchors would wait
+                # forever while its window closes (six platform-card near misses
+                # at factor 0.42-0.50 were never retried for exactly this reason).
+                prio += min(15.0, 0.02 * (hours - last))
             max_t = float(state.max_exposure)
             if state.best_dur[i] > 0:
                 # Realized-data retry: scale the exposure that produced the
                 # current best factor. Precise where the model estimate is not.
                 t_retry = state.best_dur[i] * (NEAR_MISS_AIM / max(1e-9, state.factor[i])) * 1.15
+                # A retry that mathematically exceeds the cap is still worth the
+                # capped exposure: the next night's quality may be better than
+                # the night behind the best factor. Rejecting it outright left a
+                # 0.479-at-3000s target untried for its last 40 nights while the
+                # very same night at 3600s would have crossed the threshold.
+                t_retry = min(t_retry, float(state.max_exposure))
                 consider(i, scoring.required_threshold, "required", prio, None, max_t, t_override=t_retry)
             else:
                 # No duration history: aim above the line with a cushion --
