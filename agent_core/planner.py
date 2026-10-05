@@ -47,7 +47,7 @@ import os
 
 REQUIRED_BONUS = float(os.environ.get("SAC_REQ_BONUS", "60"))
 REQUEST_BONUS_CAP = float(os.environ.get("SAC_REQ_CAP", "6"))
-REQUEST_URGENCY_HOURS = 6.0
+REQUEST_URGENCY_HOURS = float(os.environ.get("SAC_REQ_URGENCY", "14"))
 LLM_DUR_LO = float(os.environ.get("SAC_LLM_DUR_LO", "1.0"))
 LLM_DUR_HI = float(os.environ.get("SAC_LLM_DUR_HI", "1.0"))
 LLM_AVOID = os.environ.get("SAC_LLM_AVOID", "0") != "0"
@@ -94,7 +94,7 @@ NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
 REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
-NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.62"))
+NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
 # Fault reporting: after the free false allowance is burnt, only a deep drop
 # (near-certain fault) is worth the -150 risk; and a recent ALL-sky weather
