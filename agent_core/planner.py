@@ -139,6 +139,9 @@ class Planner:
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
+        self._notice_events: list = []     # (hours, sorted notices, hours since last quake or None)
+        self._notice_sig: tuple | None = None
+        self._report_log: list = []        # (hours, correct|None) -- None = emitted, outcome pending
         self.total_assigned = 0
         self.total_hit = 0
         self.request_bonus: dict[int, float] = {}
@@ -181,12 +184,20 @@ class Planner:
         if any(key.partition("|")[0] in WEATHER_EXPLAINS and key.partition("|")[2] == "ALL"
                for key in state.notices):
             self.last_all_weather_hours = hours
+        quake_hours = (None if state.last_quake_at is None
+                       else (now - state.last_quake_at).total_seconds() / 3600.0)
+        sig = (tuple(sorted(state.notices)), quake_hours is not None and quake_hours < 1.0)
+        if sig != self._notice_sig:
+            self._notice_events.append((round(hours, 3), sorted(state.notices),
+                                        round(quake_hours, 2) if quake_hours is not None else None))
+            self._notice_sig = sig
         state.on_result(payload.get("last_result"), hours)
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
             self.total_hit += int(last_result.get("hit_count", 0))
         elif last_result and last_result.get("action") == "report":
+            self._report_log.append((round(hours, 3), bool(last_result.get("correct"))))
             if last_result.get("correct"):
                 self.correct_reports += 1
                 self.false_since_correct = 0
@@ -247,6 +258,25 @@ class Planner:
     def on_finish(self, payload: dict) -> None:
         self.trace.write({"event": "finish", **payload})
         self.trace.close()
+        dump_path = os.environ.get("SAC_DUMP_QUALITY")
+        if dump_path:
+            import json as _json
+            state = self.state
+            by_night: dict[int, list[float]] = {}
+            for _h, night, ratio, _clean in state.quality_log:
+                by_night.setdefault(night, []).append(ratio)
+            nightly = {str(k): sorted(v)[len(v) // 2] for k, v in sorted(by_night.items())}
+            with open(dump_path, "w", encoding="utf-8") as fh:
+                _json.dump({
+                    "samples": [(round(h, 3), n, round(r, 4), c)
+                                for h, n, r, c in state.quality_log],
+                    "nightly_medians": nightly,
+                    "notice_events": self._notice_events,
+                    "report_log": self._report_log,
+                    "band_checks": list(state._band_checks),
+                    "scale_final": round(state.scale, 4),
+                }, fh)
+            self.log(f"planner: quality dump written to {dump_path}")
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
                  f"observes={self.observe_count} reports={self.reports} llm_calls={self.llm.calls_made}")
 
@@ -443,6 +473,7 @@ class Planner:
                 return None
         self.reports += 1
         self.last_report_hours = hours
+        self._report_log.append((round(hours, 3), "emit"))
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
         return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
                 "decision_source": "llm-confirmed" if verdict else "rule"}
