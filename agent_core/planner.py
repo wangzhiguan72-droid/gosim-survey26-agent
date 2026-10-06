@@ -89,7 +89,6 @@ RESCUE_MAX_T_NEED = float(os.environ.get("SAC_RESCUE_MAX_T", "1800"))
 # slightly longer exposure to cross; dropping it after two attempts wasted
 # ~20 platform-card misses worth of penalty in exactly this band.
 NEAR_MISS_LO = 0.30
-NEAR_MISS_DEEP = float(os.environ.get("SAC_NEAR_DEEP", "0.40"))
 NEAR_MISS_MAX_ATTEMPTS = int(os.environ.get("SAC_NEAR_MAX", "5"))
 NEAR_MISS_RETRY_HOURS = float(os.environ.get("SAC_NEAR_RETRY", "10"))
 NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
@@ -644,23 +643,7 @@ class Planner:
             # the exact v6b code path.
             endgame = nights_left <= NEAR_MISS_ENDGAME_NIGHTS
             survey_tail = len(state.nights) - night_index <= SURVEY_TAIL_NIGHTS
-            # Quality-gated unlock (v8d): outside the survey tail, a DEEP near miss
-            # whose window closes within a few weeks may retry mid-survey, but only
-            # on a night whose measured sky predicts a comfortable crossing
-            # (k*t >= 0.58) -- the retry then lands instead of displacing a field
-            # for nothing. Attempts are capped so a hopeless target cannot orbit.
-            unlock = survey_tail
-            if (not unlock and near and endgame and 2 <= state.attempts[i] <= 4
-                    and state.factor[i] >= NEAR_MISS_DEEP):
-                alt_g, _az_g = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
-                lunar_g = lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)
-                model_g = scoring.quality_model(alt_g, lunar_g) or 0.0
-                if model_g > 0.0:
-                    ha_g = wrap180(lst - state.ra[i])
-                    up_g = (state.hmax[i] - ha_g) / SIDEREAL_DEG_PER_SECOND if state.hmax[i] < 180 else 1e9
-                    k_g = state.flux[i] * model_g * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
-                    unlock = k_g * min(float(state.max_exposure), up_g, seconds_left) >= 0.58
-            if not (near and endgame and unlock):
+            if not (near and endgame and survey_tail):
                 # Two failures without crossing means the flux/quality estimate
                 # was optimistic; a third try only makes sense when nights run out.
                 if state.attempts[i] >= 2 and nights_left > 2:
