@@ -153,6 +153,8 @@ class Planner:
         self.request_bonus: dict[int, float] = {}
         self.request_bonus_full: dict[int, float] = {}
         self.active_reqs: list[dict] = []
+        self.many_requests = False
+        self._last_active_req_count = -1
         self.rescue_last_try: dict[int, float] = {}
         self._dedicated_tonight: dict[int, int] = {}
         # A required target is rescuable only if a max-length exposure in near-ideal
@@ -504,11 +506,26 @@ class Planner:
         """Turn active_requests into a per-target planning bonus, capped so a request
         can win ties and attract pointings without hijacking the whole schedule the
         way an uncapped reward/remaining split did (it emptied fibre fills and cost
-        far more science than the +100 reward was worth)."""
+        far more science than the +100 reward was worth).
+
+        The preview "hard instance" cards issue 50-60 short-window requests at
+        once (the formal cards have 6). There the request machinery itself becomes
+        the hijack: every request target is a top-priority special, the dedicated
+        pass runs without its per-night cap, and the bulk required population --
+        worth far more in missed penalties than all request rewards combined --
+        starves (measured: 287-1822 required misses, -50k..-92k cards). With that
+        many live requests: bonuses are halved, only the soonest-closing requests
+        drive the dedicated pass, and its per-night cap returns (see
+        _dedicated_plan). Formal-sized feeds keep the exact old path."""
         state = self.state
-        if active:
+        many = len(active) > 12
+        if many != self.many_requests:
+            self.many_requests = many
+            self.log(f"planner: request regime: {'hard-instance (bonuses halved, dedicated capped)' if many else 'normal'}")
+        if active and (not many or len(active) != self._last_active_req_count):
             self.log(f"planner: {len(active)} active request(s) at {now}: "
                      + "; ".join(f"{r.get('request_id')} need {r.get('remaining_count', '?')} reward {r.get('completion_reward')}" for r in active))
+        self._last_active_req_count = len(active)
         bonus: dict[int, float] = {}
         bonus_full: dict[int, float] = {}
         self.active_reqs = []
@@ -536,7 +553,9 @@ class Planner:
                 hours_left = (parse_utc(deadline) - now).total_seconds() / 3600.0
                 urgency = 2.0 if hours_left < REQUEST_URGENCY_HOURS else 1.0
             full = reward / max(1, remaining) * urgency
-            per = min(full, REQUEST_BONUS_CAP)
+            if many:
+                full /= 2.0
+            per = min(full, REQUEST_BONUS_CAP / (2.0 if many else 1.0))
             for tid in req.get("target_ids") or []:
                 tid = str(tid)
                 if tid in completed:
@@ -545,6 +564,9 @@ class Planner:
                 if i is not None:
                     bonus[i] = bonus.get(i, 0.0) + per
                     bonus_full[i] = bonus_full.get(i, 0.0) + full
+        if many:
+            self.active_reqs.sort(key=lambda r: (r["deadline"] is None, r["deadline"] or now))
+            del self.active_reqs[12:]
         self.request_bonus = bonus
         self.request_bonus_full = bonus_full
 
@@ -691,9 +713,16 @@ class Planner:
         # Dedicated exposures are quality-diluting by design (they stretch into
         # worse slots for the lump sum). Cap how many run per night so the survey
         # schedule stays science-dominated; a night with an open request is exempt
-        # (there are only ~2 requests per card, each a guaranteed +100).
-        has_request = any(sp["kind"] == "request" for sp in special.values())
-        if not has_request and self._dedicated_tonight.get(night_index, 0) >= DEDICATED_PER_NIGHT:
+        # (there are only ~2 requests per card, each a guaranteed +100). On hard
+        # instances with dozens of live requests the exemption would mean "no cap,
+        # ever", so there only requests closing within 36h keep it.
+        if self.many_requests:
+            cap_exempt = any(sp["kind"] == "request" and sp["deadline"] is not None
+                             and (sp["deadline"] - now).total_seconds() < 36 * 3600
+                             for sp in special.values())
+        else:
+            cap_exempt = any(sp["kind"] == "request" for sp in special.values())
+        if not cap_exempt and self._dedicated_tonight.get(night_index, 0) >= DEDICATED_PER_NIGHT:
             return None
 
         # A field whose longest need eats most of an hour is only worth it when
