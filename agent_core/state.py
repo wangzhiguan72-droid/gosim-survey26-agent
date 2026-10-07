@@ -134,7 +134,11 @@ class SurveyState:
         # Realized ABSOLUTE sky quality per hit: factor*f0t0/(flux*t). Unlike the
         # ratio samples above this is model-free, so the rare-window harvester can
         # read "is the sky usable right now" straight off it (see planner harvest).
-        self.q_abs_log: deque = deque(maxlen=6000)         # (hours, q_abs)
+        # A plain unbounded list on purpose: a bounded deque silently stops
+        # growing, the planner's drain counter sticks, and every reading after
+        # that is frozen at hours-old quality (measured: 850 good-window probe
+        # readings never converted to a burst because of it).
+        self.q_abs_log: list[tuple[float, float]] = []     # (hours, q_abs)
         self.last_quake_at = None                          # datetime of the latest earthquake bulletin seen
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
