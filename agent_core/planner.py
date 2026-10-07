@@ -45,6 +45,7 @@ from .state import PendingPrediction
 import math
 import os
 from collections import deque
+from itertools import islice
 
 REQUIRED_BONUS = float(os.environ.get("SAC_REQ_BONUS", "60"))
 REQUEST_BONUS_CAP = float(os.environ.get("SAC_REQ_CAP", "6"))
@@ -115,6 +116,57 @@ REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
 # for A/B runs without touching code.
 PACE_L1 = float(os.environ.get("SAC_PACE_L1", "0.55"))
 PACE_L2 = float(os.environ.get("SAC_PACE_L2", "0.85"))
+
+# -- rare-window harvester (v10f) -------------------------------------------------
+# Some platform cards hide a near-permanently dead sky: realized |q| ~0.004 with
+# ~10-15% of slots in usable bursts. The value planner sizes exposures from a
+# slowly learned scale, misses the bursts and burns them on fill targets, which
+# showed up as required_missing ~1800 (-91k) with sum_best a tenth of normal.
+# The harvester reads realized quality straight off every hit (public flux:
+# q = factor*f0t0/(flux*t)), and when the card proves rare-window it (a) probes
+# cheaply while the sky is dead and (b) the instant q is usable, points the
+# densest uncrossed-required field with ALL fibres sized by the measured q.
+HARVEST_ON = os.environ.get("SAC_HARVEST", "1") != "0"
+HARVEST_Q_RARE = float(os.environ.get("SAC_HARVEST_QRARE", "0.08"))   # card-class gate
+HARVEST_Q_BURST = float(os.environ.get("SAC_HARVEST_QBURST", "0.055"))  # window gate
+HARVEST_Q_MID = float(os.environ.get("SAC_HARVEST_QMID", "0.02"))     # above: normal plan
+HARVEST_MIN_UNDONE = int(os.environ.get("SAC_HARVEST_MINUNDONE", "30"))
+HARVEST_FIELDS = int(os.environ.get("SAC_HARVEST_FIELDS", "6"))
+HARVEST_BURST_SAFETY = float(os.environ.get("SAC_HARVEST_SAFETY", "0.88"))
+HARVEST_MIN_SAMPLES = int(os.environ.get("SAC_HARVEST_SAMPLES", "16"))
+# Dead-sky probe ladder: short probes catch openings fast but cost a decision
+# each; after consecutive dead probes the exposure stretches so a 87%-dead card
+# stays inside the wallclock budget.
+HARVEST_PROBE_LADDER = tuple(int(x) for x in
+                             os.environ.get("SAC_HARVEST_PROBES", "120,300,600").split(","))
+# Window-quality gate: the platform's formal stress cards keep only a minority of
+# slots observable at decent quality. Observing straight through those stretches
+# spread ~1500 dust observations (0.04-0.13 real score per fibre) over the survey
+# and left 900+ required targets unobserved. When the best field's real-score rate
+# falls below this fraction of the recent median rate, bank the sim time and wait
+# instead. The gated rate is still appended, so the median decays through a long
+# bad stretch and observing resumes (scale-invariant: a quake/fault moves
+# predictions and the reference together, so it never triggers the gate).
+# SAC_RATE_FLOOR=0 disables.
+# Off by default: on short-card regressions (L3 -737) refusing slots cost real
+# observation time, and the formal disaster cards turned out to be pointing-offset
+# + data-loss stress, not weather -- handle those specifically instead.
+RATE_FLOOR = float(os.environ.get("SAC_RATE_FLOOR", "0"))
+# Failsafe: never refuse more than this many consecutive slots -- if good windows
+# stop coming entirely (endgame, seasonal worst case), take the dust rather than
+# starve the survey.
+GATE_DROUGHT_SLOTS = int(os.environ.get("SAC_GATE_DROUGHT", "30"))
+# Pointing-offset compensation (stress cards): the engine adds a hidden constant
+# (alt, az) offset to every commanded pointing, so assignments computed for the
+# commanded center classify onto the wrong fibres and only a small fraction of
+# exposures score. A hit pins the offset to one fibre cell: for a target hit on
+# its assigned fibre, R lies in the pitch-sized square d_hit - cell(fibre).
+# Intersecting those squares across hits pins R with no alias ambiguity; once
+# the hit rate has collapsed and the intersection is tight, every pointing is
+# commanded shifted by -est and a servo keeps re-estimating the residual.
+SAC_POINT_TRIG = float(os.environ.get("SAC_POINT_TRIG", "0.55"))
+POINT_MIN_SAMPLES = int(os.environ.get("SAC_POINT_SAMPLES", "6"))
+POINT_MAX_WIDTH_FRAC = float(os.environ.get("SAC_POINT_WIDTH", "0.35"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
@@ -127,6 +179,12 @@ WEATHER_LOOKBACK_HOURS = float(os.environ.get("SAC_WX_LOOKBACK", "0"))
 
 def _az_distance(a: float, b: float) -> float:
     return abs(wrap180(a - b))
+
+
+def _median(xs) -> float:
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 def _bulletin_text(notices: list) -> str:
@@ -171,6 +229,15 @@ class Planner:
         self._last_sim = None
         self._cycle_costs: deque = deque(maxlen=30)   # wall seconds per full decision cycle
         self._sim_advances: deque = deque(maxlen=30)  # sim seconds a cycle advances
+        self._recent_rates: deque = deque(maxlen=90)  # real score per sim second, survey observations
+        self._gated_slots = 0
+        self._gated_streak = 0
+        self._pending_reach: dict[str, float] = {}
+        self._pending_geom: dict[str, tuple[float, float]] = {}   # target -> tangent (alt, az) offset from desired center
+        self._pending_assign: dict[str, int] = {}                 # target -> assigned fibre
+        self._point_samples: list[tuple[float, float]] = []       # per-hit square centers (desired frame)
+        self._point_est: tuple[float, float] | None = None        # applied compensation (alt, az)
+        self._point_hitwindow: deque = deque(maxlen=8)            # (assigned, hits) per observe
         self._value_cache: dict[int, float] = {}
         self._dirty_values: set[int] = set()
         self._request_sig: tuple | None = None
@@ -190,6 +257,13 @@ class Planner:
         self.active_reqs: list[dict] = []
         self.rescue_last_try: dict[int, float] = {}
         self._dedicated_tonight: dict[int, int] = {}
+        # harvester bookkeeping (v10f)
+        self._q_hist: deque = deque(maxlen=64)     # (hours, realized |q|) per hit
+        self._q_seen = 0
+        self._probe_ladder_i = 0
+        self._harvest_counts = {"probe": 0, "burst": 0, "burst_fibres": 0, "burst_req": 0}
+        self._field_cache_sig: tuple | None = None
+        self._field_cache: list[int] = []
         # A required target is rescuable only if a max-length exposure in near-ideal
         # conditions can plausibly cross the required threshold; fainter ones must
         # stay buried by the attempts damp or they eat the schedule for nothing.
@@ -238,12 +312,20 @@ class Planner:
         # Targets about to be updated by on_result: their value() inputs move.
         touched = {self.state.index_of.get(tid) for tid in self.state.pending}
         touched.discard(None)
-        state.on_result(payload.get("last_result"), hours)
+        state.on_result(payload.get("last_result"), hours, self._pending_reach)
+        self._pending_reach = {}
+        ql = state.q_abs_log
+        if len(ql) < self._q_seen:   # forget_quality_history() cleared it
+            self._q_seen = 0
+        if len(ql) > self._q_seen:
+            self._q_hist.extend(islice(ql, self._q_seen, None))
+            self._q_seen = len(ql)
         self._dirty_values |= touched
         if state.resync_generation != self._seen_resync:
             self._seen_resync = state.resync_generation
             self._dirty_values.clear()
             self._value_cache.clear()
+            self.rescue_last_try.clear()
         self._t_onresult += _t.monotonic() - t0
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
@@ -265,6 +347,7 @@ class Planner:
                 self.last_false_hours = hours
                 self.log(f"planner: report false at {payload.get('now_utc')} "
                          f"(false_since_correct={self.false_since_correct})")
+        self._update_pointing(last_result)
         self._pace(payload, now)
         self._update_requests(payload.get("active_requests") or [], now)
 
@@ -295,6 +378,12 @@ class Planner:
         self._t_report += _t.monotonic() - t0
         if report is not None:
             return report
+
+        if HARVEST_ON:
+            harvest = self._harvest_plan(now, night_end, night_index, hours)
+            if harvest is not None:
+                self.observe_count += 1
+                return harvest
 
         t0 = _t.monotonic()
         dedicated = self._dedicated_plan(now, night_end, night_index, hours)
@@ -338,6 +427,8 @@ class Planner:
             self.log(f"planner: quality dump written to {dump_path}")
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
                  f"observes={self.observe_count} reports={self.reports} llm_calls={self.llm.calls_made}")
+        if any(self._harvest_counts.values()):
+            self.log(f"planner: harvest {self._harvest_counts}")
         if os.environ.get("SAC_TIMING"):
             self.log(f"planner: timing seconds decide={self._decide_seconds:.1f} "
                      f"on_result={self._t_onresult:.1f} report={self._t_report:.1f} "
@@ -370,6 +461,104 @@ class Planner:
         target = slot * step - into if into else slot * step
         cap = (night_end - now).total_seconds()
         return int(max(60, min(3600, target, cap)))
+
+    # -- pointing-offset compensation ---------------------------------------------
+
+    def _point_box(self):
+        """Intersection of the per-hit offset squares, or None when inconsistent."""
+        pitch = self.grid.pitch
+        half = pitch / 2.0
+        lo_a = lo_z = -1e9
+        hi_a = hi_z = 1e9
+        for sa, sz in self._point_samples:
+            lo_a = max(lo_a, sa - half)
+            hi_a = min(hi_a, sa + half)
+            lo_z = max(lo_z, sz - half)
+            hi_z = min(hi_z, sz + half)
+        if lo_a >= hi_a or lo_z >= hi_z:
+            self._point_samples = []  # stale mixture; restart estimation
+            return None
+        return lo_a, hi_a, lo_z, hi_z
+
+    def _note_observe_geometry(self, info, assignments, c_alt, c_az) -> None:
+        """Record tangent offsets + fibres of the action we are about to send, so the
+        next result can turn its hits into offset constraints."""
+        geom = self._pending_geom
+        assign = self._pending_assign
+        geom.clear()
+        assign.clear()
+        for fiber, item in info.items():
+            key = str(fiber)
+            if key not in assignments:
+                continue
+            offsets = tangent_offsets(item["alt"], item["az"], c_alt, c_az)
+            if offsets is None:
+                continue
+            tid = self.state.ids[item["i"]]
+            geom[tid] = offsets
+            assign[tid] = int(fiber)
+
+    def _update_pointing(self, last_result) -> None:
+        """Consume the previous observe result: fold its hits into the offset estimate."""
+        geom, assign = self._pending_geom, self._pending_assign
+        if last_result and last_result.get("action") == "observe":
+            hits = last_result.get("hits") or []
+            self._point_hitwindow.append((int(last_result.get("assigned_count", 0)),
+                                          int(last_result.get("hit_count", 0))))
+            if hits and all(h.get("target_id") in geom for h in hits):
+                for h in hits:
+                    tid = h.get("target_id")
+                    dn, de = geom[tid]
+                    fa, fz = self.grid.fiber_center(assign[tid])
+                    self._point_samples.append((dn - fa, de - fz))
+                del self._point_samples[:-120]
+                if len(self._point_hitwindow) >= 4:
+                    assigned = sum(a for a, _ in self._point_hitwindow)
+                    scored = sum(h for _, h in self._point_hitwindow)
+                    rate = scored / max(1, assigned)
+                    box = self._point_box()
+                    if box is not None:
+                        lo_a, hi_a, lo_z, hi_z = box
+                        pitch = self.grid.pitch
+                        width = max(hi_a - lo_a, hi_z - lo_z)
+                        mid = ((lo_a + hi_a) / 2.0, (lo_z + hi_z) / 2.0)
+                        # Trigger needs consistency, not tightness: every correct
+                        # hit square contains the true offset, so the box mid is
+                        # within half a pitch even when the overlap region stays
+                        # wide (a thin overlap can never drop below the threshold
+                        # when one offset component is near half a pitch).
+                        tight = width <= 0.5 * pitch and len(self._point_samples) >= 4
+                        if self._point_est is None:
+                            if rate < SAC_POINT_TRIG and len(self._point_samples) >= POINT_MIN_SAMPLES and box is not None:
+                                self._point_est = mid
+                                self._point_samples = []
+                                self._point_hitwindow.clear()
+                                # the offset, not the sky, poisoned these counters
+                                state = self.state
+                                state.misses = [0] * len(state.ids)
+                                state.attempts = [0] * len(state.ids)
+                                state.blocked.clear()
+                                self.rescue_last_try.clear()
+                                self._value_cache.clear()
+                                self._dirty_values.clear()
+                                self.log(f"planner: pointing offset suspected ({rate:.0%} hits over "
+                                         f"{assigned} assignments); compensating alt {mid[0]:+.3f} az {mid[1]:+.3f}")
+                        elif tight and len(self._point_samples) >= 4:
+                            res_a, res_z = mid
+                            if abs(res_a) > 0.08 * pitch or abs(res_z) > 0.08 * pitch:
+                                self._point_est = (self._point_est[0] + res_a, self._point_est[1] + res_z)
+                                self._point_samples = []
+                                self._point_hitwindow.clear()
+                                self.log(f"planner: pointing offset servo adjust -> "
+                                         f"alt {self._point_est[0]:+.3f} az {self._point_est[1]:+.3f}")
+        self._pending_geom = {}
+        self._pending_assign = {}
+
+    def _commanded_pointing(self, c_alt: float, c_az: float) -> dict:
+        if self._point_est is None:
+            return {"alt_deg": c_alt, "az_deg": c_az}
+        ea, ez = self._point_est
+        return {"alt_deg": max(0.5, min(89.5, c_alt - ea)), "az_deg": (c_az - ez) % 360.0}
 
     def _pace(self, payload: dict, now) -> None:
         """Do less work per decision when the wall clock is short for the nights still to come.
@@ -672,6 +861,267 @@ class Planner:
             base += REQUIRED_BONUS
         return base * damp + self.request_bonus.get(j, 0.0)
 
+    # -- rare-window harvester (v10f) --------------------------------------------
+
+    def _harvest_plan(self, now, night_end, night_index: int, hours: float):
+        """Overlay for cards whose sky is dead ~90% of the time (see HARVEST_ON).
+        Returns None on normal cards after ~16 samples, so formal-card behaviour
+        is untouched; the gates live entirely on realized-quality evidence."""
+        state = self.state
+        if len(state.required_undone) < HARVEST_MIN_UNDONE:
+            return None
+        if len(self._q_hist) < HARVEST_MIN_SAMPLES:
+            return None
+        recent = [q for _h, q in list(self._q_hist)[-32:]]
+        if _median(recent) >= HARVEST_Q_RARE:
+            return None
+        # Realized quality of the most recent exposure (all its hits share it up
+        # to airmass spread, so the median fibre is the honest reading).
+        last_h = self._q_hist[-1][0]
+        last_qs = [q for h, q in self._q_hist if h > last_h - 1e-9]
+        q_now = _median(last_qs) if last_qs else 0.0
+        seconds_left = (min(night_end, state.survey_end) - now).total_seconds()
+        if seconds_left < state.min_exposure + 60:
+            return None
+        if q_now >= HARVEST_Q_BURST:
+            act = self._harvest_burst(now, night_index, hours, q_now, seconds_left)
+            if act is not None:
+                self._probe_ladder_i = 0
+                return act
+            return None   # sky fine but nothing burstable is up: value plan earns
+        if q_now >= HARVEST_Q_MID:
+            self._probe_ladder_i = 0
+            return None   # mid band: the normal planner still earns real factors
+        return self._harvest_probe(now, night_index, hours, seconds_left)
+
+    def _harvest_fields(self, night_index: int, lst: float) -> list[int]:
+        """Anchor targets whose neighbourhood holds the most uncrossed required
+        targets. Cached per night and per 40-crossing bucket of progress."""
+        state = self.state
+        undone = state.required_undone
+        sig = (night_index, len(undone) // 40)
+        if sig == self._field_cache_sig and self._field_cache:
+            return self._field_cache
+        scored = []
+        for i in undone:
+            ha = wrap180(lst - state.ra[i])
+            h = state.hmax[i]
+            if h < 180 and not (-h + 4.0 <= ha <= h - 4.0):
+                continue   # rising/setting edge: a poor anchor for tonight
+            n = sum(1 for j in state.neighbours(state.ra[i], state.dec[i], NEIGHBOUR_RADIUS_DEG)
+                    if j in undone)
+            scored.append((n, state.flux[i], i))
+        scored.sort(reverse=True)
+        self._field_cache = [i for _n, _f, i in scored[:HARVEST_FIELDS]]
+        self._field_cache_sig = sig
+        return self._field_cache
+
+    def _harvest_burst(self, now, night_index: int, hours: float, q_now: float, seconds_left: float):
+        state = self.state
+        scoring = state.scoring
+        thresh = scoring.required_threshold
+        f0t0 = scoring.f0t0
+        lst = local_sidereal_deg(now, state.lon)
+        moon = Moon(now + timedelta(seconds=450), lst, state.lat)
+        undone = state.required_undone
+        cap_t = min(float(state.max_exposure), seconds_left)
+        best = None   # (key, c_alt, c_az, chosen, duration)
+        for anchor in self._harvest_fields(night_index, lst):
+            a_alt, a_az = radec_to_altaz(state.ra[anchor], state.dec[anchor], lst, state.lat)
+            if a_alt < state.min_alt + 1.5:
+                continue
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG)
+                    if j in undone or state.factor[j] < DONE_FACTOR]
+            if len(near) > 90:
+                near.sort(key=lambda j: (j in undone, state.flux[j]))
+                del near[:-90]
+            for fiber in range(self.grid.n):
+                d_north, d_east = self.grid.fiber_center(fiber)
+                c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
+                if not (state.min_alt + 1.5 <= c_alt <= 89.0):
+                    continue
+                c_alt, c_az = round(c_alt, 4), round(c_az, 4) % 360.0
+                # fiber -> (score, j, t_need_required)
+                chosen: dict[int, tuple[float, int, float]] = {}
+                for j in near:
+                    alt, az = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+                    if alt < state.min_alt + 0.3:
+                        continue
+                    ha = wrap180(lst - state.ra[j])
+                    up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+                    if up < state.min_exposure:
+                        continue
+                    offsets = tangent_offsets(alt, az, c_alt, c_az)
+                    if offsets is None:
+                        continue
+                    fib, margin = self.grid.classify(*offsets)
+                    if fib is None:
+                        continue
+                    if j in undone:
+                        # Size by the MEASURED window quality, not the slowly
+                        # learned scale: this is the whole point of the harvester.
+                        t_need = thresh * f0t0 / max(1e-9, state.flux[j] * q_now * HARVEST_BURST_SAFETY)
+                        if t_need > min(cap_t, up):
+                            continue
+                        v = 1e6 + state.flux[j]
+                    else:
+                        # Fill only with targets that will actually register at
+                        # this quality inside ~10 minutes; done targets are worth
+                        # nothing here (their capped hits carry no q sample).
+                        if state.flux[j] * q_now * 600.0 < 0.2 * f0t0:
+                            continue
+                        v = self._fill_value(j)
+                    if margin < EDGE_MARGIN_DEG:
+                        v *= 0.4
+                    prev = chosen.get(fib)
+                    if prev is None or v > prev[0]:
+                        chosen[fib] = (v, j, t_need if j in undone else 0.0)
+                req_fibres = [t for t in chosen.values() if t[2] > 0.0]
+                if not req_fibres:
+                    continue
+                duration = int(math.ceil(max(t[2] for t in req_fibres) / 30.0) * 30)
+                duration = int(max(state.min_exposure, min(cap_t, duration)))
+                for f in [f for f, t in chosen.items() if t[2] > duration]:
+                    del chosen[f]   # would not cross before the night/horizon cap
+                req_fibres = [t for t in chosen.values() if t[2] > 0.0]
+                if not req_fibres:
+                    continue
+                key = (len(req_fibres), sum(t[0] for t in chosen.values() if t[2] == 0.0),
+                       -duration)
+                if best is None or key > best[0]:
+                    best = (key, c_alt, c_az, dict(chosen), duration)
+        if best is None:
+            return None
+        _, c_alt, c_az, chosen, duration = best
+        n_req = sum(1 for t in chosen.values() if t[2] > 0.0)
+        self._harvest_counts["burst"] += 1
+        self._harvest_counts["burst_req"] += n_req
+        self._harvest_counts["burst_fibres"] += len(chosen)
+        act = self._emit_field(now, lst, c_alt, c_az,
+                               {f: t[1] for f, t in chosen.items()}, duration, moon, night_index,
+                               f"burst q={q_now:.2f} {n_req}req/{len(chosen)}fib {duration}s")
+        return act
+
+    def _harvest_probe(self, now, night_index: int, hours: float, seconds_left: float):
+        """Short exposure on a bright, not-done field: measures the sky's usable
+        quality directly (q = factor*f0t0/(flux*t) is exact for public flux)."""
+        state = self.state
+        lst = local_sidereal_deg(now, state.lon)
+        moon = Moon(now + timedelta(seconds=450), lst, state.lat)
+        duration = int(min(HARVEST_PROBE_LADDER[min(self._probe_ladder_i, len(HARVEST_PROBE_LADDER) - 1)],
+                           seconds_left))
+        duration = int(max(state.min_exposure, duration))
+        if duration > seconds_left:
+            return None
+        undone = state.required_undone
+        best = None
+        for anchor in self._harvest_fields(night_index, lst)[:3]:
+            a_alt, a_az = radec_to_altaz(state.ra[anchor], state.dec[anchor], lst, state.lat)
+            if a_alt < state.min_alt + 1.5:
+                continue
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG)
+                    if state.factor[j] < 0.97]   # capped hits carry no exact q sample
+            # Spread the probe across the flux ladder: at any realized quality some
+            # fibres stay uncapped and measurable (bright ones cap out in good
+            # windows, faint ones vanish in dead ones -- a brightest-first probe is
+            # blind exactly when it matters most).
+            near.sort(key=lambda j: state.flux[j])
+            if len(near) > 60:
+                step = len(near) / 60.0
+                near = [near[int(k * step)] for k in range(60)]
+            for fiber in (0, self.grid.n // 3, 2 * self.grid.n // 3):
+                d_north, d_east = self.grid.fiber_center(fiber)
+                c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
+                if not (state.min_alt + 1.5 <= c_alt <= 89.0):
+                    continue
+                c_alt, c_az = round(c_alt, 4), round(c_az, 4) % 360.0
+                chosen: dict[int, tuple[float, int]] = {}
+                for j in near:
+                    alt, az = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+                    if alt < state.min_alt + 0.3:
+                        continue
+                    offsets = tangent_offsets(alt, az, c_alt, c_az)
+                    if offsets is None:
+                        continue
+                    fib, margin = self.grid.classify(*offsets)
+                    if fib is None:
+                        continue
+                    v = 1.0 if margin >= EDGE_MARGIN_DEG else 0.4   # spread matters, not brightness
+                    prev = chosen.get(fib)
+                    if prev is None or v > prev[0]:
+                        chosen[fib] = (v, j)
+                if len(chosen) < 4:
+                    continue
+                key = (sum(1 for _v, j in chosen.values() if j in undone),
+                       sum(v for v, _ in chosen.values()))
+                if best is None or key > best[0]:
+                    best = (key, c_alt, c_az, dict(chosen))
+        if best is None:
+            return None
+        _, c_alt, c_az, chosen = best
+        self._probe_ladder_i += 1
+        self._harvest_counts["probe"] += 1
+        return self._emit_field(now, lst, c_alt, c_az, {f: j for f, (v, j) in chosen.items()},
+                                duration, moon, night_index, f"probe {duration}s {len(chosen)}fib")
+
+    def _emit_field(self, now, lst, c_alt, c_az, chosen, duration, moon, night_index, goal):
+        """Shared emitter for harvest exposures: same pending/program bookkeeping
+        as _finish_dedicated so on_result recovers factors and q samples."""
+        state = self.state
+        scoring = state.scoring
+        info: dict[int, dict] = {}
+        for fiber, j in chosen.items():
+            alt, az = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+            lunar = lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)
+            model = scoring.quality_model(alt, lunar) or 1e-9
+            ha = wrap180(lst - state.ra[j])
+            up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
+        assignments = {str(f): state.ids[it["i"]] for f, it in info.items() if it["up"] >= duration}
+        if not assignments:
+            return None
+        self._note_observe_geometry(info, assignments, c_alt, c_az)
+
+        band_scale = (state.scale / 0.95) * state.band_bias
+        votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
+        for fiber, item in info.items():
+            if str(fiber) not in assignments:
+                continue
+            band = scoring.program_band(item["model"] * band_scale)
+            votes[band] += state.weight[item["i"]] * min(1.0, item["k"] * duration) + \
+                (REQUIRED_BONUS * 0.02 if state.required[item["i"]] else 0.0)
+        program, best_score = "BACKUP", float("-inf")
+        for name in ("DARK", "BRIGHT", "BACKUP"):
+            matched = votes[name] * scoring.program_multipliers.get(name, 1.0)
+            mismatched = (votes["DARK"] + votes["BRIGHT"] + votes["BACKUP"] - votes[name]) * scoring.mismatch_multiplier
+            score = matched + mismatched
+            if score > best_score:
+                best_score, program = score, name
+
+        clean = not state.all_sky_notice()
+        state.pending.clear()
+        self._pending_reach = {}
+        for fiber, item in info.items():
+            if str(fiber) in assignments:
+                state.pending[state.ids[item["i"]]] = PendingPrediction(
+                    model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
+                    clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
+                    scale=state.scale,
+                )
+                self._pending_reach[state.ids[item["i"]]] = min(1.0, item["k"] * duration)
+        state.pending_program = program
+        state.pending_duration = duration
+        state.pending_night = night_index
+        return {
+            "action": "observe",
+            "pointing": self._commanded_pointing(c_alt, c_az),
+            "assignments": assignments,
+            "duration_seconds": duration,
+            "program": program,
+            "reason": f"harvest: {goal}",
+        }
+
     def _dedicated_plan(self, now, night_end, night_index: int, hours: float):
         state = self.state
         level = state.fast_level
@@ -915,6 +1365,7 @@ class Planner:
             return None
         if not any(item["i"] in special for fiber, item in info.items() if str(fiber) in assignments):
             return None
+        self._note_observe_geometry(info, assignments, c_alt, c_az)
 
         band_scale = (state.scale / 0.95) * state.band_bias
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
@@ -934,6 +1385,7 @@ class Planner:
 
         clean = not state.all_sky_notice()
         state.pending.clear()
+        self._pending_reach = {}
         for fiber, item in info.items():
             if str(fiber) in assignments:
                 state.pending[state.ids[item["i"]]] = PendingPrediction(
@@ -941,6 +1393,7 @@ class Planner:
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
                     scale=state.scale,
                 )
+                self._pending_reach[state.ids[item["i"]]] = min(1.0, item["k"] * duration)
         state.pending_program = program
         state.pending_duration = duration
         state.pending_night = night_index
@@ -952,7 +1405,7 @@ class Planner:
 
         return {
             "action": "observe",
-            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
+            "pointing": self._commanded_pointing(c_alt, c_az),
             "assignments": assignments,
             "duration_seconds": duration,
             "program": program,
@@ -1215,6 +1668,12 @@ class Planner:
             curve.append((duration, gain))
         if not curve:
             return None
+
+        def curve_gain(d: int) -> float:
+            for cd, cg in curve:
+                if cd == d:
+                    return cg
+            return 0.0
         if starved:
             max_gain = max(g for _, g in curve)
             duration = next(d for d, g in curve if g >= 0.98 * max_gain)
@@ -1230,12 +1689,32 @@ class Planner:
                 return None
             duration = fallback
 
+        # Window-quality gate (see RATE_FLOOR): skip slots whose best field
+        # earns far less than recent slots did. The gated rate still enters the
+        # history so a long all-bad stretch decays the median and observing
+        # resumes instead of waiting out the rest of the survey.
+        rate = curve_gain(duration) / max(1.0, float(duration))
+        if RATE_FLOOR > 0.0 and len(self._recent_rates) >= 8:
+            rates = sorted(self._recent_rates)
+            median_rate = rates[len(rates) // 2]
+            if rate < RATE_FLOOR * median_rate and self._gated_streak < GATE_DROUGHT_SLOTS:
+                self._recent_rates.append(rate)
+                self._gated_slots += 1
+                self._gated_streak += 1
+                if os.environ.get("SAC_DEBUG_REPORT") and self._gated_streak % 20 == 1:
+                    self.log(f"planner: window gate on (streak {self._gated_streak}, "
+                             f"rate {rate:.4f} < {RATE_FLOOR} x median {median_rate:.4f})")
+                return None
+        self._gated_streak = 0
+        self._recent_rates.append(rate)
+
         assignments: dict[str, str] = {}
         for fiber, item in info.items():
             if item["up"] >= duration:
                 assignments[str(fiber)] = state.ids[item["i"]]
         if not assignments:
             return None
+        self._note_observe_geometry(info, assignments, c_alt, c_az)
 
         band_scale = (state.scale / 0.95) * state.band_bias
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
@@ -1257,6 +1736,7 @@ class Planner:
 
         clean = not state.all_sky_notice()
         state.pending.clear()
+        self._pending_reach = {}
         for fiber, item in info.items():
             if str(fiber) in assignments:
                 state.pending[state.ids[item["i"]]] = PendingPrediction(
@@ -1264,13 +1744,14 @@ class Planner:
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
                     scale=state.scale,
                 )
+                self._pending_reach[state.ids[item["i"]]] = min(1.0, item["k"] * duration)
         state.pending_program = program
         state.pending_duration = duration
         state.pending_night = night_index
 
         return {
             "action": "observe",
-            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
+            "pointing": self._commanded_pointing(c_alt, c_az),
             "assignments": assignments,
             "duration_seconds": duration,
             "program": program,

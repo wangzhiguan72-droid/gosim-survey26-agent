@@ -131,6 +131,10 @@ class SurveyState:
         self._all_ratios: deque = deque(maxlen=400)        # ratio
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
         self.quality_log: deque = deque(maxlen=20000)      # (hours, night, ratio, clean, az_quad)
+        # Realized ABSOLUTE sky quality per hit: factor*f0t0/(flux*t). Unlike the
+        # ratio samples above this is model-free, so the rare-window harvester can
+        # read "is the sky usable right now" straight off it (see planner harvest).
+        self.q_abs_log: deque = deque(maxlen=6000)         # (hours, q_abs)
         self.last_quake_at = None                          # datetime of the latest earthquake bulletin seen
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
@@ -252,8 +256,10 @@ class SurveyState:
                 new_factor = 0.0
             if new_factor < self.factor[i] - 0.05:
                 # Data loss undid the exposures: they never happened, so the
-                # failed-attempt counters that gate the rescue pass must reset too.
+                # failure counters that gate the rescue pass (and the miss damp
+                # on planning value) must reset too.
                 self.attempts[i] = 0
+                self.misses[i] = 0
             self.factor[i] = new_factor
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
         self.required_undone = {i for i in self.active
@@ -271,7 +277,8 @@ class SurveyState:
     def all_sky_notice(self) -> bool:
         return any(key.partition("|")[2] == "ALL" for key in self.notices)
 
-    def on_result(self, last_result: Optional[dict], hours: float) -> None:
+    def on_result(self, last_result: Optional[dict], hours: float,
+                  predicted_reach: Optional[dict[str, float]] = None) -> None:
         if not last_result or last_result.get("action") != "observe" or not self.pending:
             self.pending.clear()
             return
@@ -322,14 +329,22 @@ class SurveyState:
                     self.required_undone.discard(i)
                 else:
                     self.attempts[i] += 1
-            if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
-                ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
-                self._samples.append((hours, ratio))
-                self._all_ratios.append(ratio)
-                self.quality_log.append((hours, self.pending_night, ratio, prediction.clean,
-                                         int((prediction.az % 360.0) // 90)))
-                if prediction.clean:
-                    self.clean_history.append((hours, self.pending_night, ratio))
+            if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0:
+                self.q_abs_log.append((hours, (factor * f0t0) / (self.flux[i] * self.pending_duration)))
+                if prediction.model > 0:
+                    ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
+                    self._samples.append((hours, ratio))
+                    self._all_ratios.append(ratio)
+                    self.quality_log.append((hours, self.pending_night, ratio, prediction.clean,
+                                             int((prediction.az % 360.0) // 90)))
+                    if prediction.clean:
+                        self.clean_history.append((hours, self.pending_night, ratio))
+            elif factor >= 0.97 and self.flux[i] > 0 and self.pending_duration > 0:
+                # Capped hit: the sky was at LEAST this good. Without the bound the
+                # harvester's window gate goes blind exactly when the sky is best
+                # (short probes on bright targets all cap out and vanish from the
+                # sample stream). The bound keeps window continuation alive.
+                self.q_abs_log.append((hours, (0.97 * f0t0) / (self.flux[i] * self.pending_duration)))
         self.pending.clear()
         # Closed-loop declaration bias, once per exposure: a mostly-mismatched
         # BACKUP/BRIGHT declaration means the actual bands were better than declared
@@ -421,6 +436,10 @@ class SurveyState:
         self._band_checks.clear()
         self._samples.clear()
         self._all_ratios.clear()
+        # A correct report repairs the instrument: the pre-repair q samples no
+        # longer describe the sky, and the harvester's window gate must not read
+        # them. Keep the planner's drain counter in sync via its own resync hook.
+        self.q_abs_log.clear()
         self.prior_scale = 1.0
         self.band_bias = 1.0
 
