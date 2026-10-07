@@ -109,6 +109,12 @@ NEAR_MISS_ENDGAME_NIGHTS = int(os.environ.get("SAC_NEAR_ENDGAME", "8"))
 # SURVEY_TAIL_NIGHTS nights, where displaced fields have no future value.
 SURVEY_TAIL_NIGHTS = int(os.environ.get("SAC_SURVEY_TAIL", "12"))
 REQ_ALT_MARGIN = float(os.environ.get("SAC_REQ_ALT_MARGIN", "1.5"))
+# Measured-cycle pace thresholds: level 1 (halved search) when the projected
+# cycle cost eats this share of the per-decision budget, level 2 (survival)
+# at the second. Tuned on the FB bench (see v10d commit); env-overridable
+# for A/B runs without touching code.
+PACE_L1 = float(os.environ.get("SAC_PACE_L1", "0.55"))
+PACE_L2 = float(os.environ.get("SAC_PACE_L2", "0.85"))
 NEAR_MISS_SAFETY = float(os.environ.get("SAC_NEAR_SAFETY", "0.58"))
 NEAR_MISS_AIM = float(os.environ.get("SAC_NEAR_AIM", "0.56"))
 REQUIRED_AIM_MULT = float(os.environ.get("SAC_REQ_AIM", "1.0"))
@@ -395,9 +401,9 @@ class Planner:
             # slow model call) must not clamp the run into survival mode, but the
             # typical cost alone has been too optimistic on formal cards.
             cycle_cost = cycles[int(0.75 * (len(cycles) - 1))]
-            if cycle_cost > 0.85 * remaining / decisions_left:
+            if cycle_cost > PACE_L2 * remaining / decisions_left:
                 level = 2
-            elif cycle_cost > 0.55 * remaining / decisions_left:
+            elif cycle_cost > PACE_L1 * remaining / decisions_left:
                 level = 1
             else:
                 level = 0
