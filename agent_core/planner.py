@@ -130,8 +130,8 @@ PACE_L2 = float(os.environ.get("SAC_PACE_L2", "0.85"))
 HARVEST_ON = os.environ.get("SAC_HARVEST", "1") != "0"
 HARVEST_DEBUG = os.environ.get("SAC_HARVEST_DEBUG", "")
 HARVEST_Q_RARE = float(os.environ.get("SAC_HARVEST_QRARE", "0.08"))   # card-class gate
-HARVEST_Q_BURST = float(os.environ.get("SAC_HARVEST_QBURST", "0.055"))  # window gate
-HARVEST_Q_MID = float(os.environ.get("SAC_HARVEST_QMID", "0.02"))     # above: normal plan
+HARVEST_Q_BURST = float(os.environ.get("SAC_HARVEST_QBURST", "0.02"))   # window gate
+HARVEST_Q_MID = float(os.environ.get("SAC_HARVEST_QMID", "0.01"))     # above: normal plan
 HARVEST_MIN_UNDONE = int(os.environ.get("SAC_HARVEST_MINUNDONE", "30"))
 HARVEST_FIELDS = int(os.environ.get("SAC_HARVEST_FIELDS", "4"))
 HARVEST_BURST_SAFETY = float(os.environ.get("SAC_HARVEST_SAFETY", "0.88"))
