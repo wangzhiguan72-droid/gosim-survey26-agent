@@ -1050,12 +1050,15 @@ class Planner:
                             continue
                         v = 1e6 + state.flux[j]
                     else:
-                        # Fill only with targets that will actually register at
-                        # this quality inside ~10 minutes; done targets are worth
-                        # nothing here (their capped hits carry no q sample).
-                        if state.flux[j] * q_now * 600.0 < 0.2 * f0t0:
+                        # Fill with targets that will fully CROSS inside this
+                        # exposure at the measured quality (weight*mult*~1.0 each);
+                        # a fill that only registers partially returns a fraction
+                        # of a fibre-second the field could have spent on a real
+                        # crossing. Done targets are worth nothing here.
+                        t_fill = 0.5 * f0t0 / max(1e-9, state.flux[j] * q_now * 0.9)
+                        if t_fill > min(cap_t, up) * 0.85:
                             continue
-                        v = self._fill_value(j)
+                        v = self._fill_value(j) * (2.0 if t_fill <= 600.0 else 1.0)
                     if margin < EDGE_MARGIN_DEG:
                         v *= 0.4
                     prev = chosen.get(fib)
