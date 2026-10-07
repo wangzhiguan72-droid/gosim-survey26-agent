@@ -56,7 +56,7 @@ def require_api_key() -> None:
 
 class LLMClient:
     def __init__(self, log=lambda text: None, call_timeout_seconds: float = 12.0,
-                 total_budget_seconds: float = 300.0, max_calls: int = 100, max_retries: int = 3):
+                 total_budget_seconds: float = 45.0, max_calls: int = 100, max_retries: int = 3):
         self.log = log
         self.base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/") or DEFAULT_BASE_URL
         self.api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("KIMI_API_KEY", "").strip()

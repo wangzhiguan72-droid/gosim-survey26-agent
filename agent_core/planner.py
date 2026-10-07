@@ -44,13 +44,19 @@ from .state import PendingPrediction
 
 import math
 import os
+from collections import deque
 
 REQUIRED_BONUS = float(os.environ.get("SAC_REQ_BONUS", "60"))
 REQUEST_BONUS_CAP = float(os.environ.get("SAC_REQ_CAP", "6"))
 REQUEST_URGENCY_HOURS = float(os.environ.get("SAC_REQ_URGENCY", "14"))
-LLM_DUR_LO = float(os.environ.get("SAC_LLM_DUR_LO", "1.0"))
-LLM_DUR_HI = float(os.environ.get("SAC_LLM_DUR_HI", "1.0"))
-LLM_AVOID = os.environ.get("SAC_LLM_AVOID", "0") != "0"
+LLM_DUR_LO = float(os.environ.get("SAC_LLM_DUR_LO", "0.9"))
+LLM_DUR_HI = float(os.environ.get("SAC_LLM_DUR_HI", "1.1"))
+# Weather advice may only ever nudge: at most this many directions, and the avoid
+# factor is a mild value discount (not the 0.35 hard dodging the bulletins get) so
+# one bad model answer cannot fence off half the sky.
+LLM_AVOID = os.environ.get("SAC_LLM_AVOID", "1") != "0"
+LLM_AVOID_MAX_DIRECTIONS = int(os.environ.get("SAC_LLM_AVOID_MAX", "2"))
+LLM_AVOID_FACTOR = float(os.environ.get("SAC_LLM_AVOID_FACTOR", "0.75"))
 LLM_VETO = os.environ.get("SAC_LLM_VETO", "0") != "0"
 RESCUE_DAMP = os.environ.get("SAC_RESCUE_DAMP", "0") != "0"
 RESCUE_DUR = os.environ.get("SAC_RESCUE_DUR", "1") != "0"
@@ -80,6 +86,11 @@ MAX_REPORTS = int(os.environ.get("SAC_MAX_REPORTS", "6"))
 # Dedicated completion mode (one-exposure threshold crossings)
 DEDICATED_SAFETY = float(os.environ.get("SAC_DED_SAFETY", "0.85"))
 DEDICATED_MAX_ANCHORS = int(os.environ.get("SAC_DED_ANCHORS", "4"))
+# Under decision starvation (pace level 2) the dedicated pass used to shut off
+# entirely -- exactly when faint required targets and request windows needed it.
+# It now survives in a one-anchor, near-miss/request-only form (SAC_L2_DEDICATED=0
+# restores the old shutoff).
+L2_DEDICATED = os.environ.get("SAC_L2_DEDICATED", "1") != "0"
 RESCUE_RETRY_HOURS = float(os.environ.get("SAC_RESCUE_RETRY", "12"))
 RESCUE_MAX_ATTEMPTS = int(os.environ.get("SAC_RESCUE_MAX_ATTEMPTS", "3"))
 BIG_SPECIAL = 1.0e5
@@ -120,6 +131,14 @@ def _bulletin_text(notices: list) -> str:
     return "; ".join(f"{n.get('event_kind')} {n.get('direction')}" for n in notices)
 
 
+def _notice_json(notice) -> str:
+    import json as _json
+    try:
+        return _json.dumps(notice, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(notice)
+
+
 class Planner:
     def __init__(self, state, log=lambda text: None):
         self.state = state
@@ -142,24 +161,35 @@ class Planner:
         self._decide_count = 0
         self._t_report = self._t_dedicated = self._t_plan = self._t_onresult = 0.0
         self._recent_decide_durs: list[float] = []
+        self._last_remaining: float | None = None
+        self._last_sim = None
+        self._cycle_costs: deque = deque(maxlen=30)   # wall seconds per full decision cycle
+        self._sim_advances: deque = deque(maxlen=30)  # sim seconds a cycle advances
+        self._value_cache: dict[int, float] = {}
+        self._dirty_values: set[int] = set()
+        self._request_sig: tuple | None = None
+        self._seen_resync = -1
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
         self._notice_events: list = []     # (hours, sorted notices, hours since last quake or None)
         self._notice_sig: tuple | None = None
+        self._advice_sig: tuple | None = None
         self._report_log: list = []        # (hours, correct|None) -- None = emitted, outcome pending
         self.total_assigned = 0
         self.total_hit = 0
         self.request_bonus: dict[int, float] = {}
         self.request_bonus_full: dict[int, float] = {}
+        self.request_threshold: dict[int, float] = {}
         self.active_reqs: list[dict] = []
         self.rescue_last_try: dict[int, float] = {}
         self._dedicated_tonight: dict[int, int] = {}
         # A required target is rescuable only if a max-length exposure in near-ideal
-        # conditions can plausibly cross the 0.5 threshold; fainter ones must stay
-        # buried by the attempts damp or they eat the schedule for nothing.
+        # conditions can plausibly cross the required threshold; fainter ones must
+        # stay buried by the attempts damp or they eat the schedule for nothing.
         f0t0 = state.scoring.f0t0
-        self._req_rescuable = [state.flux[i] * state.max_exposure * 1.2 >= 0.5 * f0t0 for i in range(len(state.ids))]
+        self._req_rescuable = [state.flux[i] * state.max_exposure * 1.2 >= state.scoring.required_threshold * f0t0
+                               for i in range(len(state.ids))]
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -199,7 +229,15 @@ class Planner:
                                         round(quake_hours, 2) if quake_hours is not None else None))
             self._notice_sig = sig
         t0 = _t.monotonic()
+        # Targets about to be updated by on_result: their value() inputs move.
+        touched = {self.state.index_of.get(tid) for tid in self.state.pending}
+        touched.discard(None)
         state.on_result(payload.get("last_result"), hours)
+        self._dirty_values |= touched
+        if state.resync_generation != self._seen_resync:
+            self._seen_resync = state.resync_generation
+            self._dirty_values.clear()
+            self._value_cache.clear()
         self._t_onresult += _t.monotonic() - t0
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
@@ -243,7 +281,7 @@ class Planner:
             return {"action": "wait", "until_utc": format_utc(nxt), "reason": "night ending"}
 
         if state.site_closed():
-            return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
+            return {"action": "wait", "duration_seconds": self._idle_wait(now, night_start, night_end),
                     "reason": "bulletin: rain/storm over the whole sky"}
 
         t0 = _t.monotonic()
@@ -264,7 +302,7 @@ class Planner:
         action = self.plan(now, night_end, night_index, hours)
         self._t_plan += _t.monotonic() - t0
         if action is None:
-            return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
+            return {"action": "wait", "duration_seconds": self._idle_wait(now, night_start, night_end),
                     "reason": "nothing useful is up"}
         self.observe_count += 1
         action["reason"] = f"{len(action['assignments'])} fibres, program {action['program']}"
@@ -310,93 +348,141 @@ class Planner:
         into = (now - night_start).total_seconds() % slot
         return int(max(60, min(3600, slot - into if into else slot)))
 
+    def _idle_wait(self, now, night_start, night_end) -> int:
+        """Weather-closure / nothing-up waiting.
+
+        Every wait burns one full decision cycle (~0.15 s of wall clock on a
+        formal card), and the old one-slot waits repeated up to ~40x per closed
+        night. Under pace pressure, land on a slot boundary several slots out
+        instead of the very next one: the sim time lost to a slower weather
+        re-check is cheap next to the wall clock each extra round trip costs.
+        Slot alignment is kept (level 0 waits exactly one slot, as before) --
+        request windows and bulletin updates are slot-shaped."""
+        slot = self.state.slot_seconds
+        into = (now - night_start).total_seconds() % slot
+        step = 1 if self.state.fast_level == 0 else 3
+        target = slot * step - into if into else slot * step
+        cap = (night_end - now).total_seconds()
+        return int(max(60, min(3600, target, cap)))
+
     def _pace(self, payload: dict, now) -> None:
         """Do less work per decision when the wall clock is short for the nights still to come.
 
-        Two signals: the nominal per-decision budget (remaining wall clock over
-        the decisions still owed) and, once a track record exists, the MEASURED
-        seconds per decision. The measured rate is what actually protects the
-        900 s wall clock on formal-scale cards (50k targets ran 0.33 s/decision
-        locally while the nominal budget said everything was fine)."""
+        The unit of cost is one full decision CYCLE -- our planning time plus the
+        transport plus the engine's own work -- measured as the drop in
+        `wallclock.remaining_seconds` between consecutive requests. That is what
+        the 900 s budget actually bills, and on formal-scale cards it runs about
+        twice the agent's own decide() time (FB: ~0.15 s/cycle vs ~0.07 s of
+        planning). Projection: cycles still owed (remaining night seconds over
+        the measured sim-seconds a cycle advances) times a conservative cycle
+        cost, versus the wall clock left."""
         state = self.state
-        remaining_wall = float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9))
+        remaining = float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9))
+        if self._last_remaining is not None and 0.0 < self._last_remaining - remaining < 600.0:
+            self._cycle_costs.append(self._last_remaining - remaining)
+        if self._last_sim is not None and 0.0 < (now - self._last_sim).total_seconds() < 6 * 3600:
+            self._sim_advances.append((now - self._last_sim).total_seconds())
+        self._last_remaining = remaining
+        self._last_sim = now
+
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
-        decisions_left = max(1.0, night_seconds / 700.0)
-        per_decision = remaining_wall / decisions_left
-        level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
-        if len(self._recent_decide_durs) >= 12:
-            # Median of recent decisions: one slow decision (e.g. processing a
-            # state_resync over tens of thousands of targets) must not clamp
-            # the whole run into 4-fibre survival mode.
-            durs = sorted(self._recent_decide_durs)
-            measured = durs[len(durs) // 2]
-            projected = measured * decisions_left
-            if projected > 0.97 * remaining_wall:
+        advances = sorted(self._sim_advances)
+        sim_per_cycle = advances[len(advances) // 2] if len(advances) >= 8 else 700.0
+        decisions_left = max(1.0, night_seconds / max(1.0, sim_per_cycle))
+        cycles = sorted(self._cycle_costs)
+        if len(cycles) >= 12:
+            # 75th percentile: one slow cycle (a state_resync over 50k targets, a
+            # slow model call) must not clamp the run into survival mode, but the
+            # typical cost alone has been too optimistic on formal cards.
+            cycle_cost = cycles[int(0.75 * (len(cycles) - 1))]
+            if cycle_cost > 0.85 * remaining / decisions_left:
                 level = 2
-            elif projected > 0.88 * remaining_wall:
-                level = max(level, 1)
+            elif cycle_cost > 0.55 * remaining / decisions_left:
+                level = 1
+            else:
+                level = 0
+        else:
+            # No cycle track record yet: the v8 nominal budget (absolute
+            # ms-per-decision thresholds). A ratio against `remaining` would
+            # self-normalize to survival mode on the very first decisions.
+            per_decision = remaining / decisions_left
+            level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
         if level != state.fast_level:
-            self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left, "
-                     f"measured {self._decide_seconds / max(1, self._decide_count) * 1000:.0f} ms)")
+            self.log(f"planner: pace level {level} ({remaining:.0f}s wall left, "
+                     f"{decisions_left:.0f} cycles owed, "
+                     f"measured median {cycles[len(cycles) // 2] * 1000 if cycles else 0:.0f} ms)")
             state.fast_level = level
 
-    # -- LLM: two calls once per night, merged -----------------------------------
+        if os.environ.get("SAC_TIMING") and self._decide_count % 400 == 0:
+            # Periodic, because the platform kills timed-out agents without a
+            # finish message -- at-finish-only timing logs never survive a FB run.
+            self.log(f"planner: timing t={self._decide_seconds:.1f}s over {self._decide_count} decisions "
+                     f"(on_result={self._t_onresult:.1f} report={self._t_report:.1f} "
+                     f"dedicated={self._t_dedicated:.1f} plan={self._t_plan:.1f}) "
+                     f"wall_left={remaining:.0f}s level={level}")
+
+    # -- LLM: weather advice, asked only when the sky's story changes -------------
 
     def _night_advice(self, night_start, payload: dict) -> None:
-        """Two independent planning questions, asked once at the start of each night,
-        each answered as {avoid_directions, duration_scale}. Their answers are merged
-        (directions to avoid are unioned; the duration scale is averaged) before being
-        applied to state.extra_avoid / state.duration_scale for the rest of the night."""
+        """Event-triggered weather advice.
+
+        The old version paid two model calls every night while its answers were
+        clamped to no-ops (avoid off, duration scale pinned at 1). Now: one call,
+        only when tonight's forecast notices or the live bulletin differ from the
+        skies the last advice already covered -- identical skies reuse the cached
+        answer for free. Its effect is deliberately mild and always applied: at
+        most LLM_AVOID_MAX_DIRECTIONS extra-avoid directions (a 0.75 value factor,
+        not the 0.35 hard dodging that bulletin notices get) and a duration scale
+        inside [LLM_DUR_LO, LLM_DUR_HI] = [0.9, 1.1]. A failed or missing call
+        just leaves the rule-based defaults (no avoid, scale 1.0)."""
         state = self.state
         night_date = (night_start - timedelta(hours=12)).date().isoformat()
-        left = float((payload.get("wallclock") or {}).get("remaining_seconds", 0))
 
         forecast_tonight = [n for n in self._last_forecast_notices if night_date in (n.get("nights") or [])]
         bulletin_notices = (payload.get("latest_bulletin") or {}).get("notices", [])
-        answer_forecast = self.llm.ask_json(
+        # No night_date on purpose: a stable multi-night weather stretch should
+        # cost ONE call, not one per night. Any forecast or bulletin change
+        # re-triggers immediately.
+        sig = (tuple(sorted(_notice_json(n) for n in forecast_tonight)),
+               tuple(sorted(f"{n.get('event_kind')}|{n.get('direction')}" for n in bulletin_notices)))
+        if sig == self._advice_sig:
+            return  # same night, same forecast, same bulletin: cached advice stands
+
+        left = float((payload.get("wallclock") or {}).get("remaining_seconds", 0))
+        hit_rate = (self.total_hit / self.total_assigned) if self.total_assigned > 0 else 1.0
+        answer = self.llm.ask_json(
             "You help schedule a telescope survey. Reply with one JSON object only: "
             '{"avoid_directions": [compass codes among N,NE,E,SE,S,SW,W,NW], "duration_scale": '
-            f"number {LLM_DUR_LO}-{LLM_DUR_HI}}}. Avoid directions with bad weather tonight, going by the forecast "
-            "and the current bulletin; use a larger duration_scale when the sky looks poor.",
+            f"number {LLM_DUR_LO}-{LLM_DUR_HI}}}. Avoid directions with bad weather tonight (at most "
+            f"{LLM_AVOID_MAX_DIRECTIONS} codes, worst first), going by the forecast, the current bulletin and the "
+            "agent's own hit rate; use a larger duration_scale when the sky looks poor, a smaller one when it "
+            "looks pristine. Be conservative: empty avoid_directions and duration_scale 1.0 are fine answers.",
             {"night": night_date, "forecast_notices_for_tonight": forecast_tonight,
-             "current_bulletin_notices": bulletin_notices},
-            left,
-        )
-
-        hit_rate = (self.total_hit / self.total_assigned) if self.total_assigned > 0 else 1.0
-        answer_bulletin = self.llm.ask_json(
-            "You help schedule a telescope survey using tonight's live weather bulletin and the "
-            'agent\'s own recent hit rate. Reply with one JSON object only: {"avoid_directions": '
-            '[compass codes among N,NE,E,SE,S,SW,W,NW], "duration_scale": number '
-            f'{LLM_DUR_LO}-{LLM_DUR_HI}}}. Avoid '
-            "directions the bulletin text describes as closed or obstructed right now. Raise "
-            "duration_scale when the hit rate has been low (the sky has been performing poorly); "
-            "lower it when the hit rate has been high.",
-            {"night": night_date, "bulletin_text": _bulletin_text(bulletin_notices),
+             "current_bulletin_text": _bulletin_text(bulletin_notices),
              "hit_rate_so_far": round(hit_rate, 3)},
             left,
         )
-
         avoid: set[str] = set()
-        scales: list[float] = []
-        for answer in (answer_forecast, answer_bulletin):
-            if not answer:
-                continue
+        scale = 1.0
+        if answer:
             if LLM_AVOID:
-                avoid |= {str(d).upper() for d in (answer.get("avoid_directions") or []) if str(d).upper() in DIRECTION_AZ}
+                ordered: list[str] = []
+                for d in (answer.get("avoid_directions") or []):
+                    d = str(d).upper()
+                    if d in DIRECTION_AZ and d not in ordered:
+                        ordered.append(d)
+                avoid = set(ordered[:LLM_AVOID_MAX_DIRECTIONS])  # model order = worst first
             try:
-                scales.append(min(LLM_DUR_HI, max(LLM_DUR_LO, float(answer.get("duration_scale", 1.0)))))
+                scale = min(LLM_DUR_HI, max(LLM_DUR_LO, float(answer.get("duration_scale", 1.0))))
             except (TypeError, ValueError):
                 pass
         state.extra_avoid = avoid
-        state.duration_scale = sum(scales) / len(scales) if scales else 1.0
-        self.log(f"planner: night {night_date} llm advice (forecast call: "
-                 f"{'ok' if answer_forecast else 'fell back'}, bulletin call: "
-                 f"{'ok' if answer_bulletin else 'fell back'}) merged avoid={sorted(avoid)} "
-                 f"duration x{state.duration_scale:.2f}")
+        state.duration_scale = scale
+        self._advice_sig = sig
+        self.log(f"planner: night {night_date} llm advice ({'ok' if answer else 'fell back'}) "
+                 f"avoid={sorted(avoid)} duration x{scale:.2f}")
         self.trace.write({"event": "night_advice", "night_date": night_date, "avoid": sorted(avoid),
-                          "scale": state.duration_scale, "forecast_call_ok": bool(answer_forecast),
-                          "bulletin_call_ok": bool(answer_bulletin)})
+                          "scale": scale, "call_ok": bool(answer)})
 
     # -- instrument fault reporting (deterministic rules + LLM confirmation) -----
 
@@ -511,7 +597,9 @@ class Planner:
                      + "; ".join(f"{r.get('request_id')} need {r.get('remaining_count', '?')} reward {r.get('completion_reward')}" for r in active))
         bonus: dict[int, float] = {}
         bonus_full: dict[int, float] = {}
+        thresholds: dict[int, float] = {}
         self.active_reqs = []
+        sig_parts: list = []
         for req in active:
             remaining = req.get("remaining_count")
             if remaining is None:
@@ -522,6 +610,11 @@ class Planner:
             targets_left = [state.index_of[str(t)] for t in (req.get("target_ids") or [])
                             if str(t) not in completed and str(t) in state.index_of]
             deadline = parse_utc(req["deadline_utc"]) if req.get("deadline_utc") else None
+            urgency = 1.0
+            if deadline is not None:
+                hours_left = (deadline - now).total_seconds() / 3600.0
+                urgency = 2.0 if hours_left < REQUEST_URGENCY_HOURS else 1.0
+            sig_parts.append((req.get("request_id"), remaining, req.get("deadline_utc"), urgency))
             if remaining > 0 and targets_left:
                 self.active_reqs.append({
                     "id": req.get("request_id"), "targets_left": targets_left,
@@ -530,11 +623,6 @@ class Planner:
                 })
             if remaining <= 0:
                 continue
-            urgency = 1.0
-            deadline = req.get("deadline_utc")
-            if deadline:
-                hours_left = (parse_utc(deadline) - now).total_seconds() / 3600.0
-                urgency = 2.0 if hours_left < REQUEST_URGENCY_HOURS else 1.0
             full = reward / max(1, remaining) * urgency
             per = min(full, REQUEST_BONUS_CAP)
             for tid in req.get("target_ids") or []:
@@ -545,8 +633,17 @@ class Planner:
                 if i is not None:
                     bonus[i] = bonus.get(i, 0.0) + per
                     bonus_full[i] = bonus_full.get(i, 0.0) + full
+                    thresholds[i] = max(thresholds.get(i, 0.0),
+                                        float(req.get("completion_factor_threshold", 0.5)))
+        # Only a change in the request set (or in how much of it is left) moves
+        # per-target bonuses; until then the cached planning values stay valid.
+        sig = tuple(sig_parts)
+        if sig != self._request_sig:
+            self._dirty_values |= bonus.keys() | self.request_bonus.keys()
+            self._request_sig = sig
         self.request_bonus = bonus
         self.request_bonus_full = bonus_full
+        self.request_threshold = thresholds
 
     # -- dedicated completion mode ----------------------------------------------
     # Both observation requests and the required threshold pay a lump sum the
@@ -563,14 +660,16 @@ class Planner:
         if state.factor[j] >= DONE_FACTOR:
             return self.request_bonus.get(j, 0.0)
         damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j])
-        base = state.weight[j] * (1.0 - state.factor[j] ** 2)
-        if state.required[j] and state.factor[j] < 0.5:
+        f = state.factor[j]
+        base = state.weight[j] * (1.0 - f * f)
+        if state.required[j] and f < state.scoring.required_threshold:
             base += REQUIRED_BONUS
         return base * damp + self.request_bonus.get(j, 0.0)
 
     def _dedicated_plan(self, now, night_end, night_index: int, hours: float):
         state = self.state
-        if state.fast_level >= 2:
+        level = state.fast_level
+        if level >= 2 and not L2_DEDICATED:
             return None
         horizon = min(night_end, state.survey_end)
         seconds_left = (horizon - now).total_seconds()
@@ -584,14 +683,18 @@ class Planner:
         special: dict[int, dict] = {}
 
         def consider(i: int, threshold: float, kind: str, prio: float, deadline=None, max_t: float | None = None, safety: float | None = None, t_override: float | None = None) -> None:
+            # Hour-angle gate first: pure arithmetic, no trig. Roughly half the
+            # required targets fail it on any given decision, and the altitude
+            # check below correlates almost perfectly with it (hmax IS the hour
+            # angle at which the target sits at the altitude floor).
+            ha = wrap180(lst - state.ra[i])
+            h = state.hmax[i]
+            if h < 180 and not (-h <= ha <= h):
+                return
             alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
             # Request windows are short: a smaller altitude cushion for their
             # anchors than the survey-wide 1.5 deg (SAC_REQ_ALT_MARGIN).
             if alt < state.min_alt + (REQ_ALT_MARGIN if kind == "request" else 1.5):
-                return
-            ha = wrap180(lst - state.ra[i])
-            h = state.hmax[i]
-            if h < 180 and not (-h <= ha <= h):
                 return
             up = (h - ha) / SIDEREAL_DEG_PER_SECOND if h < 180 else 1e9
             if up < state.min_exposure:
@@ -628,8 +731,12 @@ class Planner:
             share = req["reward"] / max(1, req["remaining"])
             for i in req["targets_left"]:
                 consider(i, req["threshold"], "request", 1000.0 + share, req["deadline"])
-        for i in state.active:
-            if not state.required[i] or state.factor[i] >= scoring.required_threshold - 1e-9:
+        for i in state.required_undone:
+            if level >= 2 and not (NEAR_MISS_LO <= state.factor[i] < scoring.required_threshold):
+                # Survival pace keeps only the near-miss band: targets one
+                # well-sized exposure away from crossing. Wide-open rescues of
+                # faint targets are exactly the schedule poison the endgame
+                # gates below exist to prevent.
                 continue
             if not self._req_rescuable[i]:
                 continue
@@ -707,14 +814,17 @@ class Planner:
         # The dedicated anchor search costs O(anchors x fibres x neighbours) and
         # runs before every plan pass; on 100-fibre year-long cards it alone can
         # eat a third of the wall clock, so pace pressure narrows it too.
-        n_anchors = DEDICATED_MAX_ANCHORS if state.fast_level < 1 else max(1, DEDICATED_MAX_ANCHORS // 2)
-        fibers = (range(self.grid.n) if state.fast_level < 2
+        n_anchors = (1 if level >= 2 else DEDICATED_MAX_ANCHORS // 2) if level >= 1 else DEDICATED_MAX_ANCHORS
+        fibers = (range(self.grid.n) if level < 2
                   else tuple(range(0, self.grid.n, max(1, self.grid.n // 4))) or (0,))
         best = None  # (key, c_alt, c_az, chosen)
         for anchor, spec in ordered[:n_anchors]:
             a_alt, a_az = spec["alt"], spec["az"]
             near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG)
                     if j in special or state.factor[j] < DONE_FACTOR or self.request_bonus.get(j, 0.0) > 0.0]
+            if level >= 1 and len(near) > 48:
+                near.sort(key=lambda j: -self._fill_value(j))
+                del near[48:]
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -862,7 +972,7 @@ class Planner:
                 factor = min(factor, 0.35)
         for direction in state.extra_avoid:
             if direction in DIRECTION_AZ and _az_distance(az, DIRECTION_AZ[direction]) <= 67.5 and alt < 70.0:
-                factor = min(factor, 0.35)
+                factor = min(factor, LLM_AVOID_FACTOR)
         for blocked_az, blocked_alt in state.blocked[-40:]:
             if _az_distance(az, blocked_az) <= 12.0 and alt <= blocked_alt + 3.0:
                 factor = min(factor, 0.2)
@@ -894,19 +1004,41 @@ class Planner:
             return None
         min_visible = min(MIN_VISIBLE_SECONDS, seconds_left) * SIDEREAL_DEG_PER_SECOND
 
+        # Cached planning values: _value(i) only moves when a target's factor,
+        # miss count or request bonus moves, which is a handful of targets per
+        # decision -- not all ~45k live ones. The scan below reorders nothing:
+        # it returns exactly the values _value(i) would.
+        if self._dirty_values:
+            cache = self._value_cache
+            for i in self._dirty_values:
+                cache[i] = self._value(i)
+            self._dirty_values.clear()
+        value = self._value_cache.get
+
         still_active = []
         candidates: list[tuple[float, int]] = []
+        ra, hmax = state.ra, state.hmax
+        weight, factor = state.weight, state.factor
+        last_night = state.last_night
+        append = candidates.append
         for i in state.active:
-            v = self._value(i)
+            v = value(i, -1.0)
+            if v < 0.0:
+                v = self._value(i)
+                self._value_cache[i] = v
             if v <= 0.0:
                 continue
             still_active.append(i)
-            ha = wrap180(lst - state.ra[i])
-            h = state.hmax[i]
+            ha = lst - ra[i]
+            if ha > 180.0:
+                ha -= 360.0
+            elif ha < -180.0:
+                ha += 360.0
+            h = hmax[i]
             if -h <= ha <= h - min_visible:
-                nights_left = max(1, state.last_night[i] - night_index + 1)
+                nights_left = max(1, last_night[i] - night_index + 1)
                 setting = (1.0 + 0.5 * max(0.0, ha / h)) if h < 180 else 1.0
-                candidates.append((v * (1.0 + 2.0 / nights_left) * setting, i))
+                append((v * (1.0 + 2.0 / nights_left) * setting, i))
         state.active = still_active
         if not candidates:
             return None
@@ -939,12 +1071,12 @@ class Planner:
             reach = min(1.0, k * min(state.max_exposure, up, seconds_left))
             f = state.factor[i]
             gain = state.weight[i] * max(0.0, reach * reach - f * f)
-            if state.required[i] and f < 0.5 and reach >= 0.5:
+            if state.required[i] and f < scoring.required_threshold and reach >= scoring.required_threshold:
                 gain += REQUIRED_BONUS
-            gain += self.request_bonus.get(i, 0.0) * (1.0 if reach >= 0.5 else 0.0)
+            gain += self.request_bonus.get(i, 0.0) * (1.0 if reach >= scoring.required_threshold else 0.0)
             # Uncompleted required targets must not be buried after failed tries --
             # but only when a retry can physically still cross the threshold.
-            if state.required[i] and state.factor[i] < 0.5 and RESCUE_DAMP and self._req_rescuable[i]:
+            if state.required[i] and state.factor[i] < scoring.required_threshold and RESCUE_DAMP and self._req_rescuable[i]:
                 damp = (0.6 ** state.misses[i]) * (0.9 ** state.attempts[i])
             else:
                 damp = (0.6 ** state.misses[i]) * (0.7 ** state.attempts[i])
@@ -956,17 +1088,22 @@ class Planner:
         for checked, (priority, i) in enumerate(candidates):
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
-            weighted = achievable(i) * priority / max(1e-9, self._value(i))
+            weighted = achievable(i) * priority / max(1e-9, value(i, self._value(i)))
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
             return None
         anchors.sort(key=lambda t: -t[0])
 
-        n_anchors = max(2, ANCHORS // 2) if state.fast_level >= 1 else ANCHORS
+        level = state.fast_level
+        n_anchors = ANCHORS if level == 0 else (3 if level == 1 else 2)
+        # The fibre-fill loop is O(anchors x fibres x neighbours) in trig-heavy
+        # geometry; under pace pressure only the top-valued neighbours can win a
+        # fibre anyway, so cap the fill set before any offsets are computed.
+        fill_cap = None if level == 0 else (64 if level == 1 else 32)
         # Level 2 probes a spread of fibres instead of the full grid; the old
         # hard-coded (5,6,9,10) would index past a 9-fibre card and crash.
-        fibers = (range(self.grid.n) if state.fast_level < 2
+        fibers = (range(self.grid.n) if level < 2
                   else tuple(range(0, self.grid.n, max(1, self.grid.n // 4))) or (0,))
         best = None  # (total, c_alt, c_az, chosen)
         tried = 0
@@ -978,6 +1115,9 @@ class Planner:
             tried += 1
             a_alt, a_az = altaz(anchor)
             near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG) if j in visible]
+            if fill_cap is not None and len(near) > fill_cap:
+                near.sort(key=lambda j: -value(j, 0.0))
+                del near[fill_cap:]
             near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
@@ -1029,7 +1169,21 @@ class Planner:
             info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
         center_up = (c_hmax - c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
 
-        best = None  # (rate, duration)
+        best = None  # (objective, duration)
+        th = scoring.required_threshold
+        # Pace decides the exposure objective AND the gain shape.
+        # - Starved cards (level >= 1) pay for every DECISION (~0.15 s of the 900 s
+        #   budget each) while night sim time is plentiful, so they want the most
+        #   REAL score per decision. The scorer is linear in the completion factor
+        #   (score = weight * factor * program multiplier), so the objective is the
+        #   linear field gain, stopping at the shortest duration within 2% of the
+        #   best -- that lands at field saturation instead of stretching for cents.
+        # - Relaxed cards keep the classic rate objective on the quadratic gain:
+        #   reach^2 penalizes shallow exposures, which is what keeps per-second
+        #   efficiency high when wall clock is not the binding constraint
+        #   (linear-under-rate was measured flooding L cards with 300 s hits).
+        starved = state.fast_level >= 1
+        curve: list[tuple[float, float]] = []  # (duration, gain)
         for base in DURATIONS:
             duration = round((base * state.duration_scale) / 30.0) * 30
             duration = int(max(state.min_exposure, min(state.max_exposure, duration)))
@@ -1041,19 +1195,26 @@ class Planner:
                     continue
                 reached = min(1.0, item["k"] * duration)
                 f = state.factor[item["i"]]
-                gain += state.weight[item["i"]] * max(0.0, reached * reached - f * f)
-                if state.required[item["i"]] and f < 0.5 and reached >= 0.5:
+                if starved:
+                    gain += state.weight[item["i"]] * max(0.0, reached - f)
+                else:
+                    gain += state.weight[item["i"]] * max(0.0, reached * reached - f * f)
+                if state.required[item["i"]] and f < th and reached >= th:
                     # True marginal value of crossing the threshold: the bonus above
                     # the line plus the avoided end-of-survey penalty. Fainter
                     # targets that can never cross keep the plain bonus.
                     gain += REQUIRED_BONUS + (scoring.required_penalty if RESCUE_DUR and self._req_rescuable[item["i"]] else 0.0)
-                if reached >= 0.5:
+                if reached >= self.request_threshold.get(item["i"], th):
                     gain += self.request_bonus_full.get(item["i"], 0.0)
-            rate = gain / duration
-            if best is None or rate > best[0]:
-                best = (rate, duration)
-        if best is None:
+            curve.append((duration, gain))
+        if not curve:
             return None
+        if starved:
+            max_gain = max(g for _, g in curve)
+            duration = next(d for d, g in curve if g >= 0.98 * max_gain)
+            best = (max_gain, duration)
+        else:
+            best = max(((g / d, d) for d, g in curve), key=lambda t: t[0])
         duration = best[1]
         if best[0] <= 0.0:
             if state.has_recent_sample(hours):

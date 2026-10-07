@@ -110,6 +110,16 @@ class SurveyState:
         self.misses = [0] * n
         self.attempts = [0] * n
         self.active = [i for i in range(n) if self.hmax[i] > 0.0]
+        # Program declared on a target's most recent hit, so a state_resync can
+        # divide its best_score by the multiplier that likely produced it.
+        self.declared: list[Optional[str]] = [None] * n
+        # Required targets still below the completion threshold -- maintained
+        # incrementally (on_result / _resync) so the planner's dedicated rescue
+        # pass stops rescanning the full catalogue every decision.
+        self.required_undone = {i for i in self.active
+                                if self.required[i] and self.factor[i] < self.scoring.required_threshold}
+        self.resync_generation = 0
+        self._top_multiplier = max(self.scoring.program_multipliers.values()) if self.scoring.program_multipliers else 1.2
 
         self._cells: dict[int, list[tuple[float, int]]] = {}
         self._build_index()
@@ -227,16 +237,28 @@ class SurveyState:
         else:
             for target_id, score in zip(observed_ids, best_scores):
                 best[target_id] = float(score)
-        top_multiplier = max(self.scoring.program_multipliers.values()) if self.scoring.program_multipliers else 1.2
         for i in range(len(self.ids)):
             score = best.get(self.ids[i], 0.0)
-            new_factor = min(1.0, score / (self.weight[i] * top_multiplier)) if score > 0 and self.weight[i] > 0 else 0.0
+            if score > 0 and self.weight[i] > 0:
+                # best_score embeds the program multiplier of whichever exposure
+                # produced it. The declared program is the tightest denominator we
+                # have; assuming it MATCHED can only under-estimate the factor
+                # (a mismatch would have paid the smaller mismatch multiplier), so
+                # a target we call done here really is done. The old top-multiplier
+                # guess marked BACKUP-declared exposures undone and re-observed them.
+                mult = self.scoring.program_multipliers.get(self.declared[i], self._top_multiplier)
+                new_factor = min(1.0, score / (self.weight[i] * mult)) if mult > 0 else 0.0
+            else:
+                new_factor = 0.0
             if new_factor < self.factor[i] - 0.05:
                 # Data loss undid the exposures: they never happened, so the
                 # failed-attempt counters that gate the rescue pass must reset too.
                 self.attempts[i] = 0
             self.factor[i] = new_factor
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
+        self.required_undone = {i for i in self.active
+                                if self.required[i] and self.factor[i] < self.scoring.required_threshold}
+        self.resync_generation += 1
         self.pending.clear()
 
     def site_closed(self) -> bool:
@@ -294,8 +316,12 @@ class SurveyState:
             if min(1.0, factor) > self.factor[i]:
                 self.best_dur[i] = self.pending_duration
             self.factor[i] = max(self.factor[i], min(1.0, factor))
-            if self.required[i] and self.factor[i] < scoring.required_threshold:
-                self.attempts[i] += 1
+            self.declared[i] = self.pending_program
+            if self.required[i]:
+                if self.factor[i] >= scoring.required_threshold:
+                    self.required_undone.discard(i)
+                else:
+                    self.attempts[i] += 1
             if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
                 self._samples.append((hours, ratio))
